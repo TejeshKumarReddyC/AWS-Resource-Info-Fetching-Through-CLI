@@ -2,14 +2,21 @@ import boto3
 import threading
 import re
 import csv
+import time
 import subprocess
 from collections import defaultdict
 from botocore.exceptions import ClientError
 
 output_lock = threading.Lock()
 log_file = 'results.csv'
-
 arn_pattern = re.compile(r"^arn:aws:([^:]+):([^:]+):([^:]+):([^:]+):(.+)$")
+stop_event = threading.Event()
+#Auto Authentication For Every 4 Minutes to Get rid of Session Token Expiration of Base Account.
+def run_auth_loop(region, profile_name, username, password):
+    print("auth_started")
+    while not stop_event.is_set():
+        cloud_tool_auth(region, profile_name, username, password)
+        stop_event.wait(timeout=240)
 
 assumed_sessions = {}
 last_context = {'account_id': None, 'region': None}
@@ -27,6 +34,7 @@ def cloud_tool_auth(region, profile_name, username, password):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
            )
+    print("done")
     return None
 
 #Function for reading arns from a text file(arns.txt)
@@ -68,6 +76,7 @@ def log_result(arn, service, account_id, region, status, message):
             writer.writerow([arn, service, account_id, region, status, message])
 #Session Management
 def get_session(account_id, region, BASE_PROFILE, ROLE_NAME, username, password):
+    #print(account_id)
     global assumed_sessions, last_context
     if last_context['account_id'] == account_id and last_context['region'] == region:
         return assumed_sessions.get(account_id)
@@ -95,6 +104,7 @@ def get_base_account_id(BASE_PROFILE):
     return sts.get_caller_identity()['Account']
 #____SERVICE CHECK FUNCTIONS______
 def check_lambda_batch(account_id, region, arns, session):
+    #print(account_id)
     try:
         client = session.client('lambda', region_name=region)
         paginator = client.get_paginator('list_functions')
@@ -190,6 +200,8 @@ def main():
     username = input("Enter the username like MGMT...: ")
     password = input("Enter the Cyberark Password: ")
     cloud_tool_auth('us-east-1', BASE_PROFILE, username, password)
+    auth_thread = threading.Thread(target=run_auth_loop, args=('us-east-1', BASE_PROFILE, username, password), daemon=True)
+    auth_thread.start()
     all_arns = read_arns(input_file)
     grouped_arns = group_arns_by_key(all_arns)
     for key, value in grouped_arns.items():
@@ -217,8 +229,7 @@ def main():
     for t in threads:
         t.join()
     print("Resource Check Completed, See the results.csv for output")
+    stop_event.set()
+    auth_thread.join()
 if __name__ == "__main__":
     main()
-
-
-       
