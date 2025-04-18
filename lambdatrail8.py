@@ -67,7 +67,6 @@ def group_arns_by_key(arns):
             grouped[key].append(parts['full_arn'])
     return grouped
         
-
 #Logs output to a file
 def log_result(arn, service, account_id, region, status, message):
     with output_lock:
@@ -127,26 +126,40 @@ def check_lambda_batch(account_id, region, arns, session):
 def check_rds_batch(account_id, region, arns, session):
     try:
         client = session.client('rds', region_name=region)
-        paginator = client.get_paginator('describe_db_instances')
-        existing = {}
-        page_iterator = paginator.paginate(PaginationConfig={'MaxItems':1000, 'PageSize': 100})
-        for page in page_iterator:
-            for db in page['DBInstances']:
-                arn = db['DBInstanceArn']
-                version = db.get('EngineVersion', 'Unknown')
-                instance_class = db.get('DBInstanceClass', 'Unknown')
-                ca_cert = db.get('CACertificateIdentifier', 'Unknown')
-                existing[arn] = f"Engine: {version}, Class: {instance_class}, CA: {ca_cert}"
-        print(len(existing))
         for arn in arns:
-                if arn in existing:
-                   info = existing[arn]
-                   log_result(arn, 'rds', account_id, region, 'FOUND', info)  
-                else:
-                   log_result(arn, 'rds', account_id, region, 'MISSING', "RDS Instance Not found") 
+            try:
+               resource_type = arn.split(":")[5].split("/")[0]
+               identifier = arn.split(":")[-1].split("/")[-1]
+               if resource_type == "db": 
+                  response = client.describe_db_instances(DBInstanceIdentifier=identifier)
+                  instance = response['DBInstances'][0]
+                  engine_version = instance.get('EngineVersion', 'Unknown')
+                  instance_class = instance.get('DBInstanceClass', 'Unknown')
+                  ca_cert = instance.get('CACertificateIdentifier', 'Unknown')
+                  msg = f"Found - CA: {ca_cert}, Version: {engine_version}, Class: {instance_class}"
+                  log_result(arn, 'rds', account_id, region, 'FOUND', msg)
+               elif resource_type == "cluster":
+                  response = client.describe_db_clusters(DBClusterIdentifier=identifier)
+                  cluster = response['DBClusters'][0]
+                  engine_version = cluster.get('EngineVersion', 'Unknown')
+                  ca_cert = cluster.get('CACertificateIdentifier', 'Unknown')
+                  instances = cluster.get('DBClusterMembers', [])
+                  instance_ids = [inst['DBInstanceIdentifier'] for inst in instances]
+                  instance_count = len(instance_ids)
+                  log_result(arn, 'rds', account_id, region, 'FOUND', f"Cluster Engine: {engine_version}, CA: {ca_cert}, Instance Count {instance_count}, Instances: {', '.join(instance_ids)}")
+               else:
+                  log_result(arn, 'rds', account_id, region, 'MISSING', "Unknown Resource Type"  )
+                  
+            except client.exceptions.DBInstanceNotFoundFault:
+                log_result(arn, 'rds', account_id, region, 'MISSING', "Instance Not found")
+            except client.exceptions.DBClusterNotFoundFault:
+                log_result(arn, 'rds', account_id, region, 'MISSING', "Cluster Not found")
+            except Exception as e:
+                log_result(arn, 'rds', account_id, region, 'ERROR', str(e))
     except Exception as e:
-        for arn in arns:
-            log_result(arn, 'rds', account_id, region, 'ERROR', str(e))
+            for arn in arns: 
+                 log_result(arn, 'rds', account_id, region, 'ERROR', f"Client Error {str(e)}")
+  
 def check_dms_batch(account_id, region, arns, session):
     try:
         client = session.client('dms', region_name=region)
@@ -233,3 +246,5 @@ def main():
     auth_thread.join()
 if __name__ == "__main__":
     main()
+
+       
