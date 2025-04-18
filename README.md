@@ -1,4 +1,4 @@
-# AWS-Resource-Data-Fetching-Through-CLI
+# AWS-Resource-Info-Fetching-Through-CLI
 ## Tools Used
   1. AWS CLI
   2. Python 3.12
