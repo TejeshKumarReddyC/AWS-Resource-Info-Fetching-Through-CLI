@@ -1,1 +1,3 @@
-arn:aws:lambda:eu-west-1:060725138335:function:a204503-myservice-lab-eu-west-1-pg-repl1-func
+arn:aws:lambda:eu-west-1:123456789102:function:my-Lambda_func
+arn:aws:lambda:us-east-1:123456789103:function:my-Lambda_function
+
