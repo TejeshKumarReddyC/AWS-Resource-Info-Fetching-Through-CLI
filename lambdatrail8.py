@@ -166,16 +166,20 @@ def check_rds_batch(account_id, region, arns, session):
 def check_dms_batch(account_id, region, arns, session):
     try:
         client = session.client('dms', region_name=region)
-        instances = client.describe_replication_instances()['ReplicationInstances']
-        dms_map = {
-            inst['ReplicationInstanceArn']: (inst['ReplicationInstanceClass'], inst.get('EngineVersion', 'Unknown')) for inst in instances 
-        } 
+        dms_instances = []
+        for page in client.get_paginator('describe_replication_instances').paginate():
+            dms_instances.extend(page.get('ReplicationInstances', []))
         for arn in arns:
-            if arn in dms_map:
-                instance_type, version = dms_map[arn]
-                log_result(arn, 'dms', account_id, region, 'FOUND', f"InstanceType:{instance_type}, Version:{version}")
-            else:
-                log_result(arn, 'dms', account_id, region, 'MISSING', "DMS Instance not found")
+            found = False
+            for dms in dms_instances:
+                if dms.get('ReplicationInstanceArn') == arn:
+                    instance_class = dms.get('ReplicationInstanceClass', 'Unknown')
+                    engine_version = dms.get('EngineVersion', 'Unknown')
+                    log_result(arn, 'dms', account_id, region, 'FOUND', f"Class: {instance_class}, EngineVersion: {engine_version}")
+                    found = True
+                    break
+            if not found:
+                log_result(arn, 'dms', account_id, region, 'MISSING', "DMS Instance Not found")
     except Exception as e:
         for arn in arns:
             log_result(arn, 'dms', account_id, region, 'ERROR', str(e))
@@ -249,3 +253,6 @@ def main():
     auth_thread.join()
 if __name__ == "__main__":
     main()
+
+
+       
