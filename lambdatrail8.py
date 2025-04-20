@@ -102,7 +102,6 @@ def get_base_account_id(BASE_PROFILE):
     return sts.get_caller_identity()['Account']
 #____SERVICE CHECK FUNCTIONS______
 def check_lambda_batch(account_id, region, arns, session):
-    #print(account_id)
     try:
         client = session.client('lambda', region_name=region)
         paginator = client.get_paginator('list_functions')
@@ -110,12 +109,18 @@ def check_lambda_batch(account_id, region, arns, session):
         for page in paginator.paginate():
             for fn in page['Functions']:
                 existing[fn['FunctionArn']] = fn.get('Runtime', 'Unknown')
-        print(len(existing))
+
+        # Create a lowercase mapping for fallback case-insensitive match
+        existing_lower = {k.lower(): (k, v) for k, v in existing.items()}
+
         for arn in arns:
             print(f"[INFO] Processing ARN: {arn}")
             if arn in existing:
                 runtime = existing[arn]
                 log_result(arn, 'lambda', account_id, region, 'FOUND', f"Exists (Runtime: {runtime})")
+            elif arn.lower() in existing_lower:
+                orig_arn, runtime = existing_lower[arn.lower()]
+                log_result(orig_arn, 'lambda', account_id, region, 'FOUND (Case-Insensitive)', f"Exists (Runtime: {runtime})")
             else:
                 log_result(arn, 'lambda', account_id, region, 'MISSING', "Lambda Not Found")
     except Exception as e:
@@ -127,37 +132,63 @@ def check_rds_batch(account_id, region, arns, session):
         client = session.client('rds', region_name=region)
         paginator_db = client.get_paginator('describe_db_instances')
         paginator_cluster = client.get_paginator('describe_db_clusters')
+
         all_instances = []
         for page in paginator_db.paginate():
             all_instances.extend(page.get('DBInstances', []))
+
         all_clusters = []
         for page in paginator_cluster.paginate():
             all_clusters.extend(page.get('DBClusters', []))
+
+        # Prepare case-insensitive lookup maps
+        instance_arns = {inst['DBInstanceArn']: inst for inst in all_instances if 'DBInstanceArn' in inst}
+        instance_arns_lower = {k.lower(): k for k in instance_arns}
+
+        cluster_arns = {clus['DBClusterArn']: clus for clus in all_clusters if 'DBClusterArn' in clus}
+        cluster_arns_lower = {k.lower(): k for k in cluster_arns}
+
         for arn in arns:
-            matched = False
-            for instance in all_instances:
-                if instance.get('DBInstanceArn') == arn:
-                    engine = instance.get('Engine', 'Unknown')
-                    engine_version = instance.get('EngineVersion', 'Unknown')
-                    instance_class = instance.get('DBInstanceClass', 'Unknown')
-                    ca_cert = instance.get('CACertificateIdentifier', 'Unknown')
-                    log_result(arn, 'rds', account_id, region, 'FOUND', f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}")
-                    matched = True
-                    break
-            if not matched:
-                    for cluster in all_clusters:
-                        if cluster.get('DBClusterArn') == arn:
-                            engine = cluster.get('Engine', 'Unknown')
-                            engine_version = cluster.get('EngineVersion', 'Unknown')
-                            ca_cert = cluster.get('CACertificateIdentifier', 'Unknown')
-                            instances = cluster.get('DBClusterMembers', [])
-                            instance_ids = [inst['DBInstanceIdentifier'] for inst in instances]
-                            instance_count = len(instance_ids)
-                            log_result(arn, 'rds', account_id, region, 'FOUND', f"Engine: {engine} {engine_version}, Instance_count: {instance_count}, Instances: {', '.join(instance_ids)}, CA: {ca_cert}")
-                            matched = True
-                            break
-            if not matched:
+            print('yes')
+            if arn in instance_arns:
+                inst = instance_arns[arn]
+                engine = inst.get('Engine', 'Unknown')
+                engine_version = inst.get('EngineVersion', 'Unknown')
+                instance_class = inst.get('DBInstanceClass', 'Unknown')
+                ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
+                log_result(arn, 'rds', account_id, region, 'FOUND',
+                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}")
+            elif arn.lower() in instance_arns_lower:
+                matched_arn = instance_arns_lower[arn.lower()]
+                inst = instance_arns[matched_arn]
+                engine = inst.get('Engine', 'Unknown')
+                engine_version = inst.get('EngineVersion', 'Unknown')
+                instance_class = inst.get('DBInstanceClass', 'Unknown')
+                ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
+                log_result(matched_arn, 'rds', account_id, region, 'FOUND (Case-Insensitive)',
+                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}")
+            elif arn in cluster_arns:
+                clus = cluster_arns[arn]
+                engine = clus.get('Engine', 'Unknown')
+                engine_version = clus.get('EngineVersion', 'Unknown')
+                ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
+                instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
+                log_result(arn, 'rds', account_id, region, 'FOUND',
+                           f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}")
+            elif arn.lower() in cluster_arns_lower:
+                matched_arn = cluster_arns_lower[arn.lower()]
+                clus = cluster_arns[matched_arn]
+                engine = clus.get('Engine', 'Unknown')
+                engine_version = clus.get('EngineVersion', 'Unknown')
+                ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
+                instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
+                log_result(matched_arn, 'rds', account_id, region, 'FOUND (Case-Insensitive)',
+                           f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}")
+            else:
                 log_result(arn, 'rds', account_id, region, 'MISSING', 'RDS ARN Not found')
+
     except Exception as e:
         for arn in arns:
             log_result(arn, 'rds', account_id, region, 'ERROR', str(e))
@@ -186,27 +217,34 @@ def check_dms_batch(account_id, region, arns, session):
 def check_sagemaker_batch(account_id, region, arns, session):
     try:
         client = session.client('sagemaker', region_name=region)
-        notebooks = []
-        notebooks = client.list_notebook_instances()['NotebookInstances']
-        for page in client.get_paginator('list_notebook_instances').paginate():
-            notebooks.extend(page.get('NotebookInstances', []))
+        paginator = client.get_paginator('list_notebook_instances')
+        actual_arns = []
+        arn_to_name = {}
+
+        for page in paginator.paginate():
+            for notebook in page.get('NotebookInstances', []):
+                arn = notebook['NotebookInstanceArn']
+                name = notebook['NotebookInstanceName']
+                actual_arns.append(arn)
+                arn_to_name[arn.lower()] = name  # map lowercased ARN to name for describe
+
+        existing_lower = {arn.lower(): arn for arn in actual_arns}
+
         for arn in arns:
-            found = False
-            for nb in notebooks:
-                notebook_name = nb['NotebookInstanceName']
-                nb_desc = client.describe_notebook_instance(NotebookInstanceName=notebook_name)
-                if nb_desc.get('NotebookInstanceArn') == arn:
-                    instance_type = nb_desc.get('InstanceType', 'Unknown') 
-                    platform = nb_desc.get('PlatformIdentifier', 'Unknown')
-                    lifecycle = nb_desc.get('NotebookInstanceLifecycleConfigName', 'None')
-                    log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Platform: {platform}")
-                    found = True
-                    break
-            if not found:
-                log_result(arn, 'sagemaker', account_id, region, "MISSING", "Notebook ARN not found")
+            if arn in actual_arns:
+                nb_desc = client.describe_notebook_instance(NotebookInstanceName=arn_to_name[arn.lower()])
+                platform = nb_desc.get('PlatformIdentifier', 'Unknown')
+                log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Platform: {platform}")
+            elif arn.lower() in existing_lower:
+                actual_arn = existing_lower[arn.lower()]
+                nb_desc = client.describe_notebook_instance(NotebookInstanceName=arn_to_name[arn.lower()])
+                platform = nb_desc.get('PlatformIdentifier', 'Unknown')
+                log_result(actual_arn, 'sagemaker', account_id, region, 'FOUND (Case-Insensitive)', f"Platform: {platform}")
+            else:
+                log_result(arn, 'sagemaker', account_id, region, 'MISSING', 'Notebook ARN not found')
     except Exception as e:
         for arn in arns:
-            log_result(arn, 'sagemaker', account_id, region, "ERROR", str(e))
+            log_result(arn, 'sagemaker', account_id, region, 'ERROR', str(e))
 
 def check_mq_batch(account_id, region, arns, session):
     try:
@@ -218,18 +256,31 @@ def check_mq_batch(account_id, region, arns, session):
         for page in paginator.paginate():
             for broker in page.get('BrokerSummaries', []):
                 aws_brokers[broker['BrokerArn']] = broker['BrokerId']
+
+        # Also build a lowercase mapping for case-insensitive comparison
+        lower_arn_map = {arn.lower(): (arn, broker_id) for arn, broker_id in aws_brokers.items()}
+
         for arn in arns:
-            broker_id = aws_brokers.get(arn)
-            if broker_id:
+            if arn in aws_brokers:
+                broker_id = aws_brokers[arn]
                 try:
                     response = client.describe_broker(BrokerId=broker_id)
                     engine_type = response.get('EngineType', 'Unknown')
                     engine_version = response.get('EngineVersion', 'Unknown')
-                    broker_name = response.get('BrokerName', 'Unknown')
                     log_result(arn, 'mq', account_id, region, 'FOUND',
                                f"Engine: {engine_type}, Version: {engine_version}")
                 except Exception as e:
                     log_result(arn, 'mq', account_id, region, 'ERROR', str(e))
+            elif arn.lower() in lower_arn_map:
+                actual_arn, broker_id = lower_arn_map[arn.lower()]
+                try:
+                    response = client.describe_broker(BrokerId=broker_id)
+                    engine_type = response.get('EngineType', 'Unknown')
+                    engine_version = response.get('EngineVersion', 'Unknown')
+                    log_result(actual_arn, 'mq', account_id, region, 'FOUND (Case-Insensitive)',
+                               f"Engine: {engine_type}, Version: {engine_version}")
+                except Exception as e:
+                    log_result(actual_arn, 'mq', account_id, region, 'ERROR', str(e))
             else:
                 log_result(arn, 'mq', account_id, region, 'MISSING', "MQ ARN Not found")
 
