@@ -199,7 +199,7 @@ def check_sagemaker_batch(account_id, region, arns, session):
                     instance_type = nb_desc.get('InstanceType', 'Unknown') 
                     platform = nb_desc.get('PlatformIdentifier', 'Unknown')
                     lifecycle = nb_desc.get('NotebookInstanceLifecycleConfigName', 'None')
-                    log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Instance: {instance_type}, Platform: {platform}, Lifecycle: {lifecycle}")
+                    log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Platform: {platform}")
                     found = True
                     break
             if not found:
@@ -227,7 +227,7 @@ def check_mq_batch(account_id, region, arns, session):
                     engine_version = response.get('EngineVersion', 'Unknown')
                     broker_name = response.get('BrokerName', 'Unknown')
                     log_result(arn, 'mq', account_id, region, 'FOUND',
-                               f"Broker: {broker_name}, Engine: {engine_type}, Version: {engine_version}")
+                               f"Engine: {engine_type}, Version: {engine_version}")
                 except Exception as e:
                     log_result(arn, 'mq', account_id, region, 'ERROR', str(e))
             else:
@@ -236,14 +236,55 @@ def check_mq_batch(account_id, region, arns, session):
     except Exception as e:
         for arn in arns:
             log_result(arn, 'mq', account_id, region, 'ERROR', str(e))
-                                    
+
+def check_waf_batch(account_id, region, arns, session):
+    for arn in arns:
+        try:
+            service = arn.split(':')[2]
+
+            if service == 'wafv2':
+                client = session.client('wafv2', region_name=region)
+                scope = 'REGIONAL' if ':regional/' in arn else 'CLOUDFRONT'
+                parts = arn.split('/')
+                acl_name = parts[-2]
+                acl_id = parts[-1]
+
+                response = client.list_web_acls(Scope=scope)
+                found = any(acl['Name'] == acl_name and acl['Id'] == acl_id for acl in response['WebACLs'])
+
+                if found:
+                    log_result(arn, 'waf', account_id, region, f'FOUND (AWS WAF v2 - {scope})', '')
+                else:
+                    log_result(arn, 'waf', account_id, region, 'MISSING', 'Not found in AWS WAF v2')
+
+            elif service in ['waf', 'waf-regional']:
+                client = session.client(service, region_name=region)
+                acl_id = arn.split('/')[-1]
+                response = client.list_web_acls()
+
+                found = any(acl['WebACLId'] == acl_id for acl in response['WebACLs'])
+                waf_type = 'WAF Classic (CloudFront)' if service == 'waf' else 'WAF Classic (Regional)'
+
+                if found:
+                    log_result(arn, 'waf', account_id, region, f'FOUND ({waf_type})', '')
+                else:
+                    log_result(arn, 'waf', account_id, region, 'MISSING', f'Not found in {waf_type}')
+            else:
+                log_result(arn, 'waf', account_id, region, 'ERROR', 'Unknown WAF service in ARN')
+
+        except Exception as e:
+            log_result(arn, 'waf', account_id, region, 'ERROR', str(e))
+        
 #___________SERVICE FUNCTION MAP______________
 SERVICE_FUNCTION_MAP = {
     'lambda': check_lambda_batch,
     'rds' : check_rds_batch,
     'dms' : check_dms_batch,
     'sagemaker': check_sagemaker_batch,
-    'mq': check_mq_batch
+    'mq': check_mq_batch,
+    'waf-regional': check_waf_batch,
+    'waf': check_waf_batch,
+    'wafv2': check_waf_batch
 }
 
 #_______________MAIN EXECUTION_________________
@@ -287,3 +328,6 @@ def main():
     auth_thread.join()
 if __name__ == "__main__":
     main()
+
+
+       
