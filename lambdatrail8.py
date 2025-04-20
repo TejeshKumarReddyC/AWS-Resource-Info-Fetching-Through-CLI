@@ -187,7 +187,6 @@ def check_sagemaker_batch(account_id, region, arns, session):
     try:
         client = session.client('sagemaker', region_name=region)
         notebooks = []
-
         notebooks = client.list_notebook_instances()['NotebookInstances']
         for page in client.get_paginator('list_notebook_instances').paginate():
             notebooks.extend(page.get('NotebookInstances', []))
@@ -213,23 +212,27 @@ def check_mq_batch(account_id, region, arns, session):
     try:
         client = session.client('mq', region_name=region)
         paginator = client.get_paginator('list_brokers')
-        matched_arns = {arn: False for arn in arns}
+        aws_brokers = {}
+
+        # Build a dictionary of BrokerArn -> BrokerId
         for page in paginator.paginate():
             for broker in page.get('BrokerSummaries', []):
-                broker_arn = broker.get('BrokerArn')
-                if broker_arn in matched_arns:
-                    try:
-                        response = client.describe_broker(BrokerId=broker['BrokerId']) 
-                        engine_type = response.get('EngineType', 'Unknown')
-                        engine_version = response.get('EngineVersion', 'Unknown')
-                        broker_name = response.get('BrokerName', 'Unknown')
-                        log_result(broker_arn, 'mq', account_id, region, 'FOUND', f"Broker: {broker_name}, Engine: {engine_type}, Version: {engine_version}")
-                        matched_arns[broker_arn] = True
-                    except Exception as e:
-                        log_result(broker_arn, 'mq', account_id, region, 'ERROR', str(e))
-        for arn, found in matched_arns.items():
-            if not found:
+                aws_brokers[broker['BrokerArn']] = broker['BrokerId']
+        for arn in arns:
+            broker_id = aws_brokers.get(arn)
+            if broker_id:
+                try:
+                    response = client.describe_broker(BrokerId=broker_id)
+                    engine_type = response.get('EngineType', 'Unknown')
+                    engine_version = response.get('EngineVersion', 'Unknown')
+                    broker_name = response.get('BrokerName', 'Unknown')
+                    log_result(arn, 'mq', account_id, region, 'FOUND',
+                               f"Broker: {broker_name}, Engine: {engine_type}, Version: {engine_version}")
+                except Exception as e:
+                    log_result(arn, 'mq', account_id, region, 'ERROR', str(e))
+            else:
                 log_result(arn, 'mq', account_id, region, 'MISSING', "MQ ARN Not found")
+
     except Exception as e:
         for arn in arns:
             log_result(arn, 'mq', account_id, region, 'ERROR', str(e))
@@ -284,6 +287,3 @@ def main():
     auth_thread.join()
 if __name__ == "__main__":
     main()
-
-
-       
