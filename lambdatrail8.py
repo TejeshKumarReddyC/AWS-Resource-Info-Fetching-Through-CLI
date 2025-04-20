@@ -9,7 +9,7 @@ from botocore.exceptions import ClientError
 
 output_lock = threading.Lock()
 log_file = 'results.csv'
-arn_pattern = re.compile(r"^arn:aws:([^:]+):([^:]+):([^:]+):([^:]+):(.+)$")
+arn_pattern = re.compile(r"^arn:aws:([^:]+):([^:]*):([^:]*):([^:/]*)([:/].+)?$")
 stop_event = threading.Event()
 #Auto Authentication For Every 4 Minutes to Get rid of Session Token Expiration of Base Account.
 def run_auth_loop(region, profile_name, username, password):
@@ -46,12 +46,11 @@ def parse_arn(arn):
     match = arn_pattern.match(arn)
     if not match:
        return None
-    service, region, account, resource = match.group(1), match.group(2), match.group(3), match.group(5)
+    service, region, account = match.group(1), match.group(2), match.group(3)
     return {
           'service': service,
           'region': region,
           'account': account,
-          'resource': resource,
           'full_arn': arn
       }
 def group_arns_by_key(arns):
@@ -187,29 +186,61 @@ def check_dms_batch(account_id, region, arns, session):
 def check_sagemaker_batch(account_id, region, arns, session):
     try:
         client = session.client('sagemaker', region_name=region)
-        notebooks = client.list_notebook_instances()['NotebookInstances']
-        sagemaker_map = {}
-        for nb in notebooks:
-            name = nb['NotebookInstanceName']
-            nb_details = client.describe_notebook_instance(NotebookInstanceName=name)
-            arn = nb_details['NotebookInstanceArn']
-            jupyter_version = nb_details.get('NotebookInstanceLifecycleConfigName', 'Unknown')
-            sagemaker_map[arn] = jupyter_version
-            for arn in arns:
-                if arn in sagemaker_map:
-                    version = sagemaker_map[arn]
-                    log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Jupyter Version:{version}")
-                else:
-                    log_result(arn, 'sagemaker', account_id, region, 'MISSING', f"Notebook Instance Not found")
-    except Exception as e:
-        log_result(arn, 'sagemaker', account_id, region, "ERROR", str(e))
+        notebooks = []
 
+        notebooks = client.list_notebook_instances()['NotebookInstances']
+        for page in client.get_paginator('list_notebook_instances').paginate():
+            notebooks.extend(page.get('NotebookInstances', []))
+        for arn in arns:
+            found = False
+            for nb in notebooks:
+                notebook_name = nb['NotebookInstanceName']
+                nb_desc = client.describe_notebook_instance(NotebookInstanceName=notebook_name)
+                if nb_desc.get('NotebookInstanceArn') == arn:
+                    instance_type = nb_desc.get('InstanceType', 'Unknown') 
+                    platform = nb_desc.get('PlatformIdentifier', 'Unknown')
+                    lifecycle = nb_desc.get('NotebookInstanceLifecycleConfigName', 'None')
+                    log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Instance: {instance_type}, Platform: {platform}, Lifecycle: {lifecycle}")
+                    found = True
+                    break
+            if not found:
+                log_result(arn, 'sagemaker', account_id, region, "MISSING", "Notebook ARN not found")
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'sagemaker', account_id, region, "ERROR", str(e))
+
+def check_mq_batch(account_id, region, arns, session):
+    try:
+        client = session.client('mq', region_name=region)
+        paginator = client.get_paginator('list_brokers')
+        matched_arns = {arn: False for arn in arns}
+        for page in paginator.paginate():
+            for broker in page.get('BrokerSummaries', []):
+                broker_arn = broker.get('BrokerArn')
+                if broker_arn in matched_arns:
+                    try:
+                        response = client.describe_broker(BrokerId=broker['BrokerId']) 
+                        engine_type = response.get('EngineType', 'Unknown')
+                        engine_version = response.get('EngineVersion', 'Unknown')
+                        broker_name = response.get('BrokerName', 'Unknown')
+                        log_result(broker_arn, 'mq', account_id, region, 'FOUND', f"Broker: {broker_name}, Engine: {engine_type}, Version: {engine_version}")
+                        matched_arns[broker_arn] = True
+                    except Exception as e:
+                        log_result(broker_arn, 'mq', account_id, region, 'ERROR', str(e))
+        for arn, found in matched_arns.items():
+            if not found:
+                log_result(arn, 'mq', account_id, region, 'MISSING', "MQ ARN Not found")
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'mq', account_id, region, 'ERROR', str(e))
+                                    
 #___________SERVICE FUNCTION MAP______________
 SERVICE_FUNCTION_MAP = {
     'lambda': check_lambda_batch,
     'rds' : check_rds_batch,
     'dms' : check_dms_batch,
-    'sagemaker': check_sagemaker_batch
+    'sagemaker': check_sagemaker_batch,
+    'mq': check_mq_batch
 }
 
 #_______________MAIN EXECUTION_________________
