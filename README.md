@@ -10,3 +10,9 @@
   4. csv
   5. threading
   6. collections
+## Features
+  1. Supports Multiple AWS Services ( Data of multiple AWS Resources from different services, regions and accounts can be fetched dynamically.)
+  2. Threading (Groups arns based on service, region and account. Threading will be used for each group so that fetching parallelly.)
+  3. Auto-Authentication (Auto Authentication For Every 4 Minutes to Get rid of Session Token Expiration of Base Account.)
+  4. Lowercase mapping for fallback case-insensitive match.( It catches the arns with  Lower or Upper case so that not a single arn will be missed by case sensitivity.)
+  5. Modular 
