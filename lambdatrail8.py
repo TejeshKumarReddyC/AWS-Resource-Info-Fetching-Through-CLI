@@ -1,3 +1,4 @@
+
 import boto3
 import threading
 import re
@@ -36,6 +37,17 @@ def cloud_tool_auth(region, profile_name, username, password):
            )
     print("done")
     return None
+def get_env_tag(session, arn, region):
+    try:
+        tag_client = session.client('resourcegroupstaggingapi', region_name=region)
+        response = tag_client.get_resources(ResourceARNList=[arn])
+        if response['ResourceTagMappingList']:
+            tags = response['ResourceTagMappingList'][0].get('Tags', [])
+            # Return all tags as a semicolon-separated key=value string
+            return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch tags for {arn}: {e}")
+    return ""
 
 #Function for reading arns from a text file(arns.txt)
 def read_arns(file_path):
@@ -67,11 +79,11 @@ def group_arns_by_key(arns):
     return grouped
         
 #Logs output to a file
-def log_result(arn, service, account_id, region, status, message):
+def log_result(arn, service, account_id, region, status, message, env=""):
     with output_lock:
         with open(log_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([arn, service, account_id, region, status, message])
+            writer.writerow([arn, service, account_id, region, status, message, env])
 #Session Management
 def get_session(account_id, region, BASE_PROFILE, ROLE_NAME, username, password):
     #print(account_id)
@@ -110,23 +122,27 @@ def check_lambda_batch(account_id, region, arns, session):
             for fn in page['Functions']:
                 existing[fn['FunctionArn']] = fn.get('Runtime', 'Unknown')
 
-        # Create a lowercase mapping for fallback case-insensitive match
         existing_lower = {k.lower(): (k, v) for k, v in existing.items()}
 
         for arn in arns:
             print(f"[INFO] Processing ARN: {arn}")
+
             if arn in existing:
                 runtime = existing[arn]
-                log_result(arn, 'lambda', account_id, region, 'FOUND', f"Exists (Runtime: {runtime})")
+                env_value = get_env_tag(session, arn, region)
+                log_result(arn, 'lambda', account_id, region, 'FOUND', f"Exists (Runtime: {runtime})", env=env_value)
+
             elif arn.lower() in existing_lower:
                 orig_arn, runtime = existing_lower[arn.lower()]
-                log_result(orig_arn, 'lambda', account_id, region, 'FOUND (Case-Insensitive)', f"Exists (Runtime: {runtime})")
+                env_value = get_env_tag(session, orig_arn, region)
+                log_result(orig_arn, 'lambda', account_id, region, 'FOUND (Case-Insensitive)', f"Exists (Runtime: {runtime})", env=env_value)
+
             else:
-                log_result(arn, 'lambda', account_id, region, 'MISSING', "Lambda Not Found")
+                log_result(arn, 'lambda', account_id, region, 'MISSING', "Lambda Not Found", env="")
+
     except Exception as e:
         for arn in arns:
             log_result(arn, 'lambda', account_id, region, 'ERROR', str(e))
-
 def check_rds_batch(account_id, region, arns, session):
     try:
         client = session.client('rds', region_name=region)
@@ -341,8 +357,8 @@ SERVICE_FUNCTION_MAP = {
 #_______________MAIN EXECUTION_________________
 def main():
     input_file = 'arns.txt'
-    BASE_PROFILE = input("Enter base account profile: ")
-    ROLE_NAME = input("Enter the ROLE_NAME: ")
+    BASE_PROFILE = "tr-enterprise-cicd-prod"
+    ROLE_NAME = "human-role/207950-SupportReadOnly"
     username = input("Enter the username like MGMT...: ")
     password = input("Enter the Cyberark Password: ")
     cloud_tool_auth('us-east-1', BASE_PROFILE, username, password)
@@ -353,7 +369,7 @@ def main():
     for key, value in grouped_arns.items():
       with open(log_file, 'w', newline='') as f:
          writer = csv.writer(f)
-         writer.writerow(['ARN', 'Service', 'AccountId', 'Region', 'Status', 'Message'])
+         writer.writerow(['ARN', 'Service', 'AccountId', 'Region', 'Status', 'Message', 'Tags'])
 
     threads = []
     for (service, account_id, region), arns in grouped_arns.items():
@@ -379,6 +395,3 @@ def main():
     auth_thread.join()
 if __name__ == "__main__":
     main()
-
-
-       
