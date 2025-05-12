@@ -341,7 +341,52 @@ def check_waf_batch(account_id, region, arns, session):
 
         except Exception as e:
             log_result(arn, 'waf', account_id, region, 'ERROR', str(e))
-        
+def check_cloudhsm(account_id, region, arns, session):
+#def check_hsm_batch(account_id, region, cluster_identifiers, session):
+    """
+    Accepts a list of CloudHSM cluster ARNs, names (from tags), or cluster IDs.
+    Checks presence of each in the specified region and logs the result.
+    """
+    try:
+        client = session.client('cloudhsmv2', region_name=region)
+        response = client.describe_clusters()
+        clusters = response.get('Clusters', [])
+
+        id_to_cluster = {c['ClusterId']: c for c in clusters}
+
+        # Map names from tags to cluster IDs
+        name_to_id = {}
+        for cluster in clusters:
+            for tag in cluster.get('Tags', []):
+                if tag['Key'].lower() == 'name':
+                    name_to_id[tag['Value']] = cluster['ClusterId']
+
+        for identifier in arns:
+            cluster_id = None
+
+            if identifier.startswith("arn:"):
+                match = re.search(r'cluster/([^:/]+)', identifier)
+                cluster_id = match.group(1) if match else None
+            elif identifier in name_to_id:
+                cluster_id = name_to_id[identifier]
+            else:
+                # Assume it's a raw ClusterId
+                cluster_id = identifier
+
+            cluster = id_to_cluster.get(cluster_id)
+            if cluster:
+                name = next((t['Value'] for t in cluster.get('Tags', []) if t['Key'].lower() == 'name'), cluster_id)
+                state = cluster.get('State', 'Unknown')
+                hsm_type = cluster.get('HsmType', 'Unknown')
+                subnet_ids = cluster.get('SubnetIds', [])
+                log_result(identifier, 'cloudhsm', account_id, region, 'FOUND',
+                           f"State: {state}, HSM Type: {hsm_type}, Subnets: {subnet_ids}")
+            else:
+                log_result(identifier, 'cloudhsm', account_id, region, 'MISSING', 'Cluster not found in region')
+
+    except Exception as e:
+        for identifier in arns:
+            log_result(identifier, 'cloudhsm', account_id, region, 'ERROR', str(e))  
 #___________SERVICE FUNCTION MAP______________
 SERVICE_FUNCTION_MAP = {
     'lambda': check_lambda_batch,
@@ -351,7 +396,8 @@ SERVICE_FUNCTION_MAP = {
     'mq': check_mq_batch,
     'waf-regional': check_waf_batch,
     'waf': check_waf_batch,
-    'wafv2': check_waf_batch
+    'wafv2': check_waf_batch,
+    'cloudhsm': check_cloudhsm
 }
 
 #_______________MAIN EXECUTION_________________
