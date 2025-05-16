@@ -1,4 +1,3 @@
-
 import boto3
 import threading
 import re
@@ -37,18 +36,129 @@ def cloud_tool_auth(region, profile_name, username, password):
            )
     print("done")
     return None
+def get_waf_tags(session, arn, region):
+    try:
+        arn_lower = arn.lower()
+
+        # Detect WAFv2 (newer generation)
+        if ":wafv2:" in arn:
+            wafv2 = session.client('wafv2', region_name=region)
+            try:
+                response = wafv2.list_tags_for_resource(ResourceARN=arn)
+                tags = response.get('TagInfoForResource', {}).get('TagList', [])
+                return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+            except Exception as e:
+                print(f"[WARNING] Failed to fetch WAFv2 tags for {arn}: {e}")
+        # Detect WAF Classic
+        elif ":waf-regional:" in arn_lower:
+            # Use waf-regional in the specified region
+            client = session.client("waf-regional", region_name=region)
+            response = client.list_tags_for_resource(ResourceARN=arn)
+            tags = response.get("TagList", [])
+            return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+
+        elif ":waf:" in arn_lower:
+            # Use us-east-1 for global WAF Classic (CloudFront)
+            client = session.client("waf", region_name="us-east-1")
+            response = client.list_tags_for_resource(ResourceARN=arn)
+            tags = response.get("TagList", [])
+            return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+
+        else:
+            print(f"[WARNING] Unknown WAF service type for ARN: {arn}")
+
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch WAF tags for {arn}: {e}")
+    return ""
+def get_sagemaker_tags(session, arn, region):
+    try:
+        sm_client = session.client('sagemaker', region_name=region)
+
+        # Try exact match first
+        try:
+            response = sm_client.list_tags(ResourceArn=arn)
+            tags = response.get('Tags', [])
+            return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+        except sm_client.exceptions.ClientError as ce:
+            if "ValidationException" not in str(ce):
+                raise  # Reraise if it's not a validation issue (e.g., resource doesn't exist)
+
+        # Try case-insensitive fallback
+        paginator = session.client('resourcegroupstaggingapi', region_name=region).get_paginator('get_resources')
+        for page in paginator.paginate(ResourceTypeFilters=["sagemaker"]):
+            for resource in page.get('ResourceTagMappingList', []):
+                if resource['ResourceARN'].lower() == arn.lower():
+                    tags = resource.get('Tags', [])
+                    return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch SageMaker tags for {arn}: {e}")
+    return ""
+
 def get_env_tag(session, arn, region):
     try:
-        tag_client = session.client('resourcegroupstaggingapi', region_name=region)
-        response = tag_client.get_resources(ResourceARNList=[arn])
-        if response['ResourceTagMappingList']:
-            tags = response['ResourceTagMappingList'][0].get('Tags', [])
-            # Return all tags as a semicolon-separated key=value string
-            return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+        # Normalize ARN to lowercase for service detection
+        match = re.match(r"arn:aws:([^:]+):", arn, re.IGNORECASE)
+        service = match.group(1).lower() if match else None
+
+        if service in ['waf', 'wafv2', 'waf-regional']:
+            return get_waf_tags(session, arn, region)
+        elif service == "sagemaker":
+            return get_sagemaker_tags(session, arn, region)
+        elif service == "ecs":
+            return get_ecs_tags(session, arn, region)
+        else:
+            tag_client = session.client('resourcegroupstaggingapi', region_name=region)
+            paginator = tag_client.get_paginator('get_resources')
+            page_iterator = paginator.paginate(ResourceARNList=[arn])
+
+            # First try exact match
+            for page in page_iterator:
+                for resource in page.get('ResourceTagMappingList', []):
+                    if resource['ResourceARN'] == arn:
+                        tags = resource.get('Tags', [])
+                        return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+
+            # Case-insensitive fallback
+            page_iterator = paginator.paginate()
+            for page in page_iterator:
+                for resource in page.get('ResourceTagMappingList', []):
+                    if resource['ResourceARN'].lower() == arn.lower():
+                        tags = resource.get('Tags', [])
+                        return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
+
     except Exception as e:
         print(f"[WARNING] Failed to fetch tags for {arn}: {e}")
     return ""
 
+def get_ecs_tags(session, arn, region):
+    try:
+        ecs_client = session.client('ecs', region_name=region)
+
+        # Extract service name from short ARN
+        match = re.match(r"arn:aws:ecs:[^:]+:[^:]+:service/(.+)", arn)
+        if not match:
+            raise ValueError("Invalid ECS ARN format")
+        service_name = match.group(1).split('/')[-1]
+
+        # List all clusters and search for the service
+        clusters = ecs_client.list_clusters()['clusterArns']
+        for cluster_arn in clusters:
+            response = ecs_client.describe_services(
+                cluster=cluster_arn,
+                services=[service_name]
+            )
+            services = response.get('services', [])
+            for service in services:
+                if service['status'] == 'ACTIVE' and service['serviceName'] == service_name:
+                    long_arn = service['serviceArn']
+                    tag_response = ecs_client.list_tags_for_resource(resourceArn=long_arn)
+                    tags = tag_response.get('tags', [])
+                    return "; ".join(f"{tag['key']}={tag['value']}" for tag in tags)
+
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch ECS tags for {arn}: {e}")
+    return ""
 #Function for reading arns from a text file(arns.txt)
 def read_arns(file_path):
     with open(file_path, 'r') as f:
@@ -172,8 +282,9 @@ def check_rds_batch(account_id, region, arns, session):
                 engine_version = inst.get('EngineVersion', 'Unknown')
                 instance_class = inst.get('DBInstanceClass', 'Unknown')
                 ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
+                env_value = get_env_tag(session, arn, region)
                 log_result(arn, 'rds', account_id, region, 'FOUND',
-                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}")
+                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}", env=env_value)
             elif arn.lower() in instance_arns_lower:
                 matched_arn = instance_arns_lower[arn.lower()]
                 inst = instance_arns[matched_arn]
@@ -181,17 +292,19 @@ def check_rds_batch(account_id, region, arns, session):
                 engine_version = inst.get('EngineVersion', 'Unknown')
                 instance_class = inst.get('DBInstanceClass', 'Unknown')
                 ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
+                env_value = get_env_tag(session, arn, region)
                 log_result(matched_arn, 'rds', account_id, region, 'FOUND (Case-Insensitive)',
-                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}")
+                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}", env=env_value)
             elif arn in cluster_arns:
                 clus = cluster_arns[arn]
                 engine = clus.get('Engine', 'Unknown')
                 engine_version = clus.get('EngineVersion', 'Unknown')
                 ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
                 instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
+                env_value = get_env_tag(session, arn, region)
                 log_result(arn, 'rds', account_id, region, 'FOUND',
                            f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
-                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}")
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}",env=env_value)
             elif arn.lower() in cluster_arns_lower:
                 matched_arn = cluster_arns_lower[arn.lower()]
                 clus = cluster_arns[matched_arn]
@@ -199,11 +312,12 @@ def check_rds_batch(account_id, region, arns, session):
                 engine_version = clus.get('EngineVersion', 'Unknown')
                 ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
                 instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
+                env_value = get_env_tag(session, arn, region)
                 log_result(matched_arn, 'rds', account_id, region, 'FOUND (Case-Insensitive)',
                            f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
-                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}")
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}",env=env_value)
             else:
-                log_result(arn, 'rds', account_id, region, 'MISSING', 'RDS ARN Not found')
+                log_result(arn, 'rds', account_id, region, 'MISSING', 'RDS ARN Not found', env="")
 
     except Exception as e:
         for arn in arns:
@@ -221,11 +335,12 @@ def check_dms_batch(account_id, region, arns, session):
                 if dms.get('ReplicationInstanceArn') == arn:
                     instance_class = dms.get('ReplicationInstanceClass', 'Unknown')
                     engine_version = dms.get('EngineVersion', 'Unknown')
-                    log_result(arn, 'dms', account_id, region, 'FOUND', f"Class: {instance_class}, EngineVersion: {engine_version}")
+                    env_value = get_env_tag(session, arn, region)
+                    log_result(arn, 'dms', account_id, region, 'FOUND', f"Class: {instance_class}, EngineVersion: {engine_version}", env=env_value)
                     found = True
                     break
             if not found:
-                log_result(arn, 'dms', account_id, region, 'MISSING', "DMS Instance Not found")
+                log_result(arn, 'dms', account_id, region, 'MISSING', "DMS Instance Not found", env="")
     except Exception as e:
         for arn in arns:
             log_result(arn, 'dms', account_id, region, 'ERROR', str(e))
@@ -250,14 +365,16 @@ def check_sagemaker_batch(account_id, region, arns, session):
             if arn in actual_arns:
                 nb_desc = client.describe_notebook_instance(NotebookInstanceName=arn_to_name[arn.lower()])
                 platform = nb_desc.get('PlatformIdentifier', 'Unknown')
-                log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Platform: {platform}")
+                env_value = get_env_tag(session, arn, region)
+                log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Platform: {platform}", env=env_value)
             elif arn.lower() in existing_lower:
                 actual_arn = existing_lower[arn.lower()]
                 nb_desc = client.describe_notebook_instance(NotebookInstanceName=arn_to_name[arn.lower()])
                 platform = nb_desc.get('PlatformIdentifier', 'Unknown')
-                log_result(actual_arn, 'sagemaker', account_id, region, 'FOUND (Case-Insensitive)', f"Platform: {platform}")
+                env_value = get_env_tag(session, arn, region)
+                log_result(actual_arn, 'sagemaker', account_id, region, 'FOUND (Case-Insensitive)', f"Platform: {platform}", env=env_value)
             else:
-                log_result(arn, 'sagemaker', account_id, region, 'MISSING', 'Notebook ARN not found')
+                log_result(arn, 'sagemaker', account_id, region, 'MISSING', 'Notebook ARN not found', env="")
     except Exception as e:
         for arn in arns:
             log_result(arn, 'sagemaker', account_id, region, 'ERROR', str(e))
@@ -283,8 +400,9 @@ def check_mq_batch(account_id, region, arns, session):
                     response = client.describe_broker(BrokerId=broker_id)
                     engine_type = response.get('EngineType', 'Unknown')
                     engine_version = response.get('EngineVersion', 'Unknown')
+                    env_value = get_env_tag(session, arn, region)
                     log_result(arn, 'mq', account_id, region, 'FOUND',
-                               f"Engine: {engine_type}, Version: {engine_version}")
+                               f"Engine: {engine_type}, Version: {engine_version}", env=env_value)
                 except Exception as e:
                     log_result(arn, 'mq', account_id, region, 'ERROR', str(e))
             elif arn.lower() in lower_arn_map:
@@ -293,12 +411,13 @@ def check_mq_batch(account_id, region, arns, session):
                     response = client.describe_broker(BrokerId=broker_id)
                     engine_type = response.get('EngineType', 'Unknown')
                     engine_version = response.get('EngineVersion', 'Unknown')
+                    env_value = get_env_tag(session, arn, region)
                     log_result(actual_arn, 'mq', account_id, region, 'FOUND (Case-Insensitive)',
-                               f"Engine: {engine_type}, Version: {engine_version}")
+                               f"Engine: {engine_type}, Version: {engine_version}", env=env_value)
                 except Exception as e:
                     log_result(actual_arn, 'mq', account_id, region, 'ERROR', str(e))
             else:
-                log_result(arn, 'mq', account_id, region, 'MISSING', "MQ ARN Not found")
+                log_result(arn, 'mq', account_id, region, 'MISSING', "MQ ARN Not found", env="")
 
     except Exception as e:
         for arn in arns:
@@ -320,9 +439,10 @@ def check_waf_batch(account_id, region, arns, session):
                 found = any(acl['Name'] == acl_name and acl['Id'] == acl_id for acl in response['WebACLs'])
 
                 if found:
-                    log_result(arn, 'waf', account_id, region, f'FOUND (AWS WAF v2 - {scope})', '')
+                    env_value = get_env_tag(session, arn, region)
+                    log_result(arn, 'waf', account_id, region, f'FOUND (AWS WAF v2 - {scope})', '', env=env_value)
                 else:
-                    log_result(arn, 'waf', account_id, region, 'MISSING', 'Not found in AWS WAF v2')
+                    log_result(arn, 'waf', account_id, region, 'MISSING', 'Not found in AWS WAF v2', env="")
 
             elif service in ['waf', 'waf-regional']:
                 client = session.client(service, region_name=region)
@@ -333,60 +453,60 @@ def check_waf_batch(account_id, region, arns, session):
                 waf_type = 'WAF Classic (CloudFront)' if service == 'waf' else 'WAF Classic (Regional)'
 
                 if found:
-                    log_result(arn, 'waf', account_id, region, f'FOUND ({waf_type})', '')
+                    env_value = get_env_tag(session, arn, region)
+                    log_result(arn, 'waf', account_id, region, f'FOUND ({waf_type})', '', env=env_value)
                 else:
-                    log_result(arn, 'waf', account_id, region, 'MISSING', f'Not found in {waf_type}')
+                    log_result(arn, 'waf', account_id, region, 'MISSING', f'Not found in {waf_type}', env="")
             else:
                 log_result(arn, 'waf', account_id, region, 'ERROR', 'Unknown WAF service in ARN')
 
         except Exception as e:
             log_result(arn, 'waf', account_id, region, 'ERROR', str(e))
-def check_cloudhsm(account_id, region, arns, session):
-#def check_hsm_batch(account_id, region, cluster_identifiers, session):
-    """
-    Accepts a list of CloudHSM cluster ARNs, names (from tags), or cluster IDs.
-    Checks presence of each in the specified region and logs the result.
-    """
+def check_ecs_batch(account_id, region, arns, session):
     try:
-        client = session.client('cloudhsmv2', region_name=region)
-        response = client.describe_clusters()
-        clusters = response.get('Clusters', [])
+        client = session.client('ecs', region_name=region)
+        paginator = client.get_paginator('list_clusters')
+        clusters = []
+        for page in paginator.paginate():
+            clusters.extend(page['clusterArns'])
 
-        id_to_cluster = {c['ClusterId']: c for c in clusters}
+        existing_services = {}
+        for cluster_arn in clusters:
+            service_paginator = client.get_paginator('list_services')
+            service_arns = []
+            for svc_page in service_paginator.paginate(cluster=cluster_arn):
+                service_arns.extend(svc_page['serviceArns'])
 
-        # Map names from tags to cluster IDs
-        name_to_id = {}
-        for cluster in clusters:
-            for tag in cluster.get('Tags', []):
-                if tag['Key'].lower() == 'name':
-                    name_to_id[tag['Value']] = cluster['ClusterId']
+            if service_arns:
+                describe_batches = [service_arns[i:i + 10] for i in range(0, len(service_arns), 10)]
+                for batch in describe_batches:
+                    response = client.describe_services(cluster=cluster_arn, services=batch)
+                    for service in response.get('services', []):
+                        service_arn = service['serviceArn']
+                        launch_type = service.get('launchType', 'Unknown')
+                        existing_services[service_arn] = (cluster_arn, launch_type)
 
-        for identifier in arns:
-            cluster_id = None
+        existing_lower = {k.lower(): (k, v) for k, v in existing_services.items()}
 
-            if identifier.startswith("arn:"):
-                match = re.search(r'cluster/([^:/]+)', identifier)
-                cluster_id = match.group(1) if match else None
-            elif identifier in name_to_id:
-                cluster_id = name_to_id[identifier]
+        for arn in arns:
+            print(f"[INFO] Processing ARN: {arn}")
+            if arn in existing_services:
+                cluster_arn, launch_type = existing_services[arn]
+                env_value = get_env_tag(session, arn, region)
+                log_result(arn, 'ecs', account_id, region, 'FOUND', f"Exists in cluster: {cluster_arn} (Launch Type: {launch_type})", env=env_value)
+
+            elif arn.lower() in existing_lower:
+                orig_arn, (cluster_arn, launch_type) = existing_lower[arn.lower()]
+                env_value = get_env_tag(session, orig_arn, region)
+                log_result(orig_arn, 'ecs', account_id, region, 'FOUND (Case-Insensitive)', f"Exists in cluster: {cluster_arn} (Launch Type: {launch_type})", env=env_value)
+
             else:
-                # Assume it's a raw ClusterId
-                cluster_id = identifier
-
-            cluster = id_to_cluster.get(cluster_id)
-            if cluster:
-                name = next((t['Value'] for t in cluster.get('Tags', []) if t['Key'].lower() == 'name'), cluster_id)
-                state = cluster.get('State', 'Unknown')
-                hsm_type = cluster.get('HsmType', 'Unknown')
-                subnet_ids = cluster.get('SubnetIds', [])
-                log_result(identifier, 'cloudhsm', account_id, region, 'FOUND',
-                           f"State: {state}, HSM Type: {hsm_type}, Subnets: {subnet_ids}")
-            else:
-                log_result(identifier, 'cloudhsm', account_id, region, 'MISSING', 'Cluster not found in region')
+                log_result(arn, 'ecs', account_id, region, 'MISSING', "ECS Service Not Found", env="")
 
     except Exception as e:
-        for identifier in arns:
-            log_result(identifier, 'cloudhsm', account_id, region, 'ERROR', str(e))  
+        for arn in arns:
+            log_result(arn, 'ecs', account_id, region, 'ERROR', str(e))
+        
 #___________SERVICE FUNCTION MAP______________
 SERVICE_FUNCTION_MAP = {
     'lambda': check_lambda_batch,
@@ -397,7 +517,7 @@ SERVICE_FUNCTION_MAP = {
     'waf-regional': check_waf_batch,
     'waf': check_waf_batch,
     'wafv2': check_waf_batch,
-    'cloudhsm': check_cloudhsm
+    'ecs': check_ecs_batch
 }
 
 #_______________MAIN EXECUTION_________________
