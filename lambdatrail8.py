@@ -1,3 +1,6 @@
+#Author- Tejesh Kumar Reddy .C
+#Version-2.4
+#Purpose-To check aws arn status in different accounts 
 import boto3
 import threading
 import re
@@ -51,17 +54,20 @@ def get_waf_tags(session, arn, region):
                 print(f"[WARNING] Failed to fetch WAFv2 tags for {arn}: {e}")
         # Detect WAF Classic
         elif ":waf-regional:" in arn_lower:
+            print("check")
             # Use waf-regional in the specified region
             client = session.client("waf-regional", region_name=region)
             response = client.list_tags_for_resource(ResourceARN=arn)
-            tags = response.get("TagList", [])
+            print(response)
+            tags = response.get('TagInfoForResource', {}).get('TagList', [])
             return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
 
         elif ":waf:" in arn_lower:
             # Use us-east-1 for global WAF Classic (CloudFront)
             client = session.client("waf", region_name="us-east-1")
             response = client.list_tags_for_resource(ResourceARN=arn)
-            tags = response.get("TagList", [])
+            print(response)
+            tags = response.get('TagInfoForResource', {}).get('TagList', [])
             return "; ".join(f"{tag['Key']}={tag['Value']}" for tag in tags)
 
         else:
