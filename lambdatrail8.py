@@ -7,6 +7,7 @@ import re
 import csv
 import time
 import subprocess
+import getpass
 from collections import defaultdict
 from botocore.exceptions import ClientError
 
@@ -744,7 +745,7 @@ def main():
     BASE_PROFILE = "tr-enterprise-cicd-prod"
     ROLE_NAME = "human-role/207950-SupportReadOnly"
     username = input("Enter the username like MGMT...: ")
-    password = input("Enter the Cyberark Password: ")
+    password = getpass.getpass("Enter the Cyberark Password: ")
     cloud_tool_auth('us-east-1', BASE_PROFILE, username, password)
     auth_thread = threading.Thread(target=run_auth_loop, args=('us-east-1', BASE_PROFILE, username, password), daemon=True)
     auth_thread.start()
