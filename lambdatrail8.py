@@ -339,6 +339,8 @@ def check_ec2_by_arn(account_id, region, arns, session):
                 for iid in chunk:
                     log_result(arn_map[iid], 'ec2', account_id, region, 'ERROR', str(e))
 
+
+
 def check_rds_batch(account_id, region, arns, session):
     try:
         client = session.client('rds', region_name=region)
@@ -368,11 +370,9 @@ def check_rds_batch(account_id, region, arns, session):
                 engine_version = inst.get('EngineVersion', 'Unknown')
                 instance_class = inst.get('DBInstanceClass', 'Unknown')
                 ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
-                db_type = 'serverless' if inst.get('DBInstanceClass') == 'db.serverless' else 'provisioned'
                 env_value = get_env_tag(session, arn, region)
                 log_result(arn, 'rds', account_id, region, 'FOUND',
-                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}, Type: {db_type}", env=env_value)
-
+                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}", env=env_value)
             elif arn.lower() in instance_arns_lower:
                 matched_arn = instance_arns_lower[arn.lower()]
                 inst = instance_arns[matched_arn]
@@ -380,23 +380,19 @@ def check_rds_batch(account_id, region, arns, session):
                 engine_version = inst.get('EngineVersion', 'Unknown')
                 instance_class = inst.get('DBInstanceClass', 'Unknown')
                 ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
-                db_type = 'serverless' if inst.get('DBInstanceClass') == 'db.serverless' else 'provisioned'
-                env_value = get_env_tag(session, matched_arn, region)
+                env_value = get_env_tag(session, arn, region)
                 log_result(matched_arn, 'rds', account_id, region, 'FOUND (Case-Insensitive)',
-                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}, Type: {db_type}", env=env_value)
-
+                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}", env=env_value)
             elif arn in cluster_arns:
                 clus = cluster_arns[arn]
                 engine = clus.get('Engine', 'Unknown')
                 engine_version = clus.get('EngineVersion', 'Unknown')
                 ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
                 instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
-                db_type = 'serverless' if clus.get('EngineMode') == 'serverless' else 'provisioned'
                 env_value = get_env_tag(session, arn, region)
                 log_result(arn, 'rds', account_id, region, 'FOUND',
                            f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
-                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}, Type: {db_type}", env=env_value)
-
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}",env=env_value)
             elif arn.lower() in cluster_arns_lower:
                 matched_arn = cluster_arns_lower[arn.lower()]
                 clus = cluster_arns[matched_arn]
@@ -404,12 +400,10 @@ def check_rds_batch(account_id, region, arns, session):
                 engine_version = clus.get('EngineVersion', 'Unknown')
                 ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
                 instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
-                db_type = 'serverless' if clus.get('EngineMode') == 'serverless' else 'provisioned'
-                env_value = get_env_tag(session, matched_arn, region)
+                env_value = get_env_tag(session, arn, region)
                 log_result(matched_arn, 'rds', account_id, region, 'FOUND (Case-Insensitive)',
                            f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
-                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}, Type: {db_type}", env=env_value)
-
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}",env=env_value)
             else:
                 log_result(arn, 'rds', account_id, region, 'MISSING', 'RDS ARN Not found', env="")
 
@@ -604,80 +598,46 @@ def check_ecs_batch(account_id, region, arns, session):
 def check_beanstalk_batch(account_id, region, arns, session):
     try:
         client = session.client('elasticbeanstalk', region_name=region)
-        platforms = client.list_platform_versions()['PlatformSummaryList']
-        platform_arn_map = {p['PlatformArn']: p for p in platforms if 'PlatformArn' in p}
-        platform_arn_map_lower = {k.lower(): k for k in platform_arn_map}
+        paginator = client.get_paginator('describe_environments')
+        arn_map = {}
+        env_name_map = {}
+
+        for page in paginator.paginate():
+            for env in page['Environments']:
+                env_arn = env.get('EnvironmentArn', '')
+                env_name = env.get('EnvironmentName', '')
+                platform_arn = env.get('PlatformArn', 'Unknown')
+                env_status = env.get('Status', 'Unknown')
+
+                if "Python 3.8 running on 64bit Amazon Linux 2" in platform_arn:
+                    status = 'PYTHON3.8_EOL'
+                else:
+                    status = f"EB_{platform_arn.split('/')[-1]}"
+
+                arn_map[env_arn.lower()] = (env_arn, status, env_status)
+                env_name_map[env_name.lower()] = (env_arn, status, env_status)
 
         for arn in arns:
-            print(f"[INFO] Processing Beanstalk Platform ARN: {arn}")
-            if arn in platform_arn_map:
-                platform = platform_arn_map[arn]
-                name = platform.get('PlatformOwner', 'Unknown') + "/" + platform.get('PlatformVersion', 'Unknown')
-                env_value = get_env_tag(session, arn, region)
-                log_result(arn, 'beanstalk-platform', account_id, region, 'FOUND',
-                           f"Platform: {name}", env=env_value)
+            print(f"[INFO] Processing Beanstalk Environment: {arn}")
 
-            elif arn.lower() in platform_arn_map_lower:
-                matched_arn = platform_arn_map_lower[arn.lower()]
-                platform = platform_arn_map[matched_arn]
-                name = platform.get('PlatformOwner', 'Unknown') + "/" + platform.get('PlatformVersion', 'Unknown')
-                env_value = get_env_tag(session, matched_arn, region)
-                log_result(matched_arn, 'beanstalk-platform', account_id, region, 'FOUND (Case-Insensitive)',
-                           f"Platform: {name}", env=env_value)
+            if arn.lower() in arn_map:
+                env_arn, env_status, runtime_status = arn_map[arn.lower()]
+                env_value = get_env_tag(session, env_arn, region)
+                log_result(env_arn, 'elasticbeanstalk', account_id, region, "FOUND", f"{env_status}, Env Status: {runtime_status}", env=env_value)
 
             else:
-                log_result(arn, 'beanstalk-platform', account_id, region, 'MISSING', 'Platform ARN not found', env="")
+                # Try to match with environment name if ARN match fails
+                env_name_key = arn.split('/')[-1].lower()
+                if env_name_key in env_name_map:
+                    env_arn, env_status, runtime_status = env_name_map[env_name_key]
+                    env_value = get_env_tag(session, env_arn, region)
+                    log_result(env_arn, 'elasticbeanstalk', account_id, region, "FOUND", f"{env_status} + ' (EnvName Match)', Env Status: {runtime_status}", env=env_value)
+                else:
+                    log_result(arn, 'elasticbeanstalk', account_id, region, 'MISSING', "Elastic Beanstalk Env Not Found (ARN/Name)", env="")
 
     except Exception as e:
         for arn in arns:
-            log_result(arn, 'beanstalk-platform', account_id, region, 'ERROR', str(e))
-
-def check_docdb_batch(account_id, region, arns, session):
-    try:
-        client = session.client('docdb', region_name=region)
-
-        instances = client.describe_db_instances().get('DBInstances', [])
-        clusters = client.describe_db_clusters().get('DBClusters', [])
-
-        docdb_resources = {}
-
-        for inst in instances:
-            if 'DBInstanceArn' in inst:
-                docdb_resources[inst['DBInstanceArn']] = {
-                    'type': 'instance',
-                    'info': f"{inst.get('Engine', 'Unknown')} {inst.get('EngineVersion', 'Unknown')} | Class: {inst.get('DBInstanceClass', 'Unknown')}"
-                }
-
-        for clus in clusters:
-            if 'DBClusterArn' in clus:
-                members = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
-                docdb_resources[clus['DBClusterArn']] = {
-                    'type': 'cluster',
-                    'info': f"{clus.get('Engine', 'Unknown')} {clus.get('EngineVersion', 'Unknown')} | Instances: {', '.join(members)}"
-                }
-
-        docdb_resources_lower = {k.lower(): k for k in docdb_resources}
-
-        for arn in arns:
-            print(f"[INFO] Processing DocDB ARN: {arn}")
-
-            if arn in docdb_resources:
-                res = docdb_resources[arn]
-                env_value = get_env_tag(session, arn, region)
-                log_result(arn, f"docdb-{res['type']}", account_id, region, 'FOUND', res['info'], env=env_value)
-
-            elif arn.lower() in docdb_resources_lower:
-                matched_arn = docdb_resources_lower[arn.lower()]
-                res = docdb_resources[matched_arn]
-                env_value = get_env_tag(session, matched_arn, region)
-                log_result(matched_arn, f"docdb-{res['type']}", account_id, region, 'FOUND (Case-Insensitive)', res['info'], env=env_value)
-
-            else:
-                log_result(arn, 'docdb', account_id, region, 'MISSING', 'Not found as instance or cluster', env="")
-
-    except Exception as e:
-        for arn in arns:
-            log_result(arn, 'docdb', account_id, region, 'ERROR', str(e))
+            log_result(arn, 'elasticbeanstalk', account_id, region, 'ERROR', str(e))
         
 def check_kafka_batch(account_id, region, arns, session):
     try:
@@ -722,6 +682,221 @@ def check_kafka_batch(account_id, region, arns, session):
         for arn in arns:
             log_result(arn, 'kafka', account_id, region, 'ERROR', str(e))
 
+def check_glue_version_batch(account_id, region, arns, session):
+    try:
+        client = session.client('glue', region_name=region)
+        paginator = client.get_paginator('get_jobs')
+        existing = {}
+
+        for page in paginator.paginate():
+            for job in page['Jobs']:
+                job_name = job['Name']
+                glue_version = job.get('GlueVersion', 'Unknown')
+                job_arn = f"arn:aws:glue:{region}:{account_id}:job/{job_name}"
+
+                if glue_version == '2.0':
+                    status = 'GLUE_2.0_EOL'
+                else:
+                    status = f"GLUE_{glue_version}"
+
+                existing[job_arn] = status
+
+        existing_lower = {k.lower(): (k, v) for k, v in existing.items()}
+
+        for arn in arns:
+            print(f"[INFO] Processing Glue Job ARN: {arn}")
+
+            if arn in existing:
+                glue_status = existing[arn]
+                env_value = get_env_tag(session, arn, region)
+
+                log_result(arn, 'glue', account_id, region,"FOUND", glue_status, env=env_value)
+
+            elif arn.lower() in existing_lower:
+                orig_arn, glue_status = existing_lower[arn.lower()]
+                env_value = get_env_tag(session, orig_arn, region)
+
+                log_result(orig_arn, 'glue', account_id, region, "FOUND(CASE_SENSI)", glue_status, env=env_value)
+
+            else:
+                log_result(arn, 'glue', account_id, region, 'MISSING', "Glue Job Not Found", env="")
+
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'glue', account_id, region, 'ERROR', str(e))
+
+def check_kinesisanalytics_sql_batch(account_id, region, arns, session):
+    try:
+        client = session.client('kinesisanalytics', region_name=region)  # v1 API for SQL apps
+        response = client.list_applications()
+        existing = {}
+
+        for app in response['ApplicationSummaries']:
+            app_name = app['ApplicationName']
+            app_arn = f"arn:aws:kinesisanalytics:{region}:{account_id}:application/{app_name}"
+
+            existing[app_arn] = 'KDA_SQL_DEPRECATED'
+
+        existing_lower = {k.lower(): (k, v) for k, v in existing.items()}
+
+        for arn in arns:
+            print(f"[INFO] Processing Kinesis Analytics SQL ARN: {arn}")
+
+            if arn in existing:
+                env_value = get_env_tag(session, arn, region)
+                log_result(arn, 'kinesisanalytics-sql', account_id, region, "FOUND", "KDA_SQL_DEPRECATED - SQL App Detected", env=env_value)
+
+            elif arn.lower() in existing_lower:
+                orig_arn, _ = existing_lower[arn.lower()]
+                env_value = get_env_tag(session, orig_arn, region)
+                log_result(orig_arn, 'kinesisanalytics-sql', account_id, region, "FOUND", "KDA_SQL_DEPRECATED - SQL App Detected", env=env_value)
+
+            else:
+                log_result(arn, 'kinesisanalytics-sql', account_id, region, 'MISSING', "Kinesis SQL App Not Found", env="")
+
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'kinesisanalytics-sql', account_id, region, 'ERROR', str(e))
+
+def check_redshift_batch(account_id, region, arns, session):
+    try:
+        client = session.client('redshift', region_name=region)
+        paginator = client.get_paginator('describe_clusters')
+        existing = {}
+
+        for page in paginator.paginate():
+            for cluster in page['Clusters']:
+                cluster_id = cluster['ClusterIdentifier']
+                node_type = cluster.get('NodeType', 'Unknown')
+                cluster_arn = f"arn:aws:redshift:{region}:{account_id}:cluster:{cluster_id}"
+
+                if node_type.lower().startswith('dc2'):
+                    status = 'DC2_EOL'
+                else:
+                    status = f"REDHSIFT_{node_type}"
+
+                existing[cluster_arn] = status
+
+        existing_lower = {k.lower(): (k, v) for k, v in existing.items()}
+
+        for arn in arns:
+            print(f"[INFO] Processing Redshift Cluster ARN: {arn}")
+
+            if arn in existing:
+                redshift_status = existing[arn]
+                env_value = get_env_tag(session, arn, region)
+                log_result(arn, 'redshift', account_id, region, "FOUND", redshift_status, env=env_value)
+
+            elif arn.lower() in existing_lower:
+                orig_arn, redshift_status = existing_lower[arn.lower()]
+                env_value = get_env_tag(session, orig_arn, region)
+                log_result(orig_arn, 'redshift', account_id, region, "FOUND (Case-Insensitive)", redshift_status, env=env_value)
+
+            else:
+                log_result(arn, 'redshift', account_id, region, 'MISSING', "Redshift Cluster Not Found", env="")
+
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'redshift', account_id, region, 'ERROR', str(e))
+
+def check_rekognition_face_collections_batch(account_id, region, arns, session):
+    try:
+        client = session.client('rekognition', region_name=region)
+        response = client.list_collections()
+        existing = {}
+
+        for collection_id in response['CollectionIds']:
+            desc = client.describe_collection(CollectionId=collection_id)
+            model_version = desc.get('FaceModelVersion', 'Unknown')
+            collection_arn = f"arn:aws:rekognition:{region}:{account_id}:collection/{collection_id}"
+
+            if model_version in ['1.0', '2.0', '3.0', '4.0']:
+                status = f'DEPRECATED_MODEL_{model_version}'
+            elif model_version == '7.0':
+                status = 'CURRENT_MODEL_V7'
+            else:
+                status = f'UNKNOWN_MODEL_{model_version}'
+
+            existing[collection_arn] = status
+
+        existing_lower = {k.lower(): (k, v) for k, v in existing.items()}
+
+        for arn in arns:
+            print(f"[INFO] Processing Rekognition Collection ARN: {arn}")
+
+            if arn in existing:
+                coll_status = existing[arn]
+                env_value = get_env_tag(session, arn, region)
+                log_result(arn, 'rekognition', account_id, region, coll_status, "Collection Version Check", env=env_value)
+
+            elif arn.lower() in existing_lower:
+                orig_arn, coll_status = existing_lower[arn.lower()]
+                env_value = get_env_tag(session, orig_arn, region)
+                log_result(orig_arn, 'rekognition', account_id, region, coll_status + ' (Case-Insensitive)', "Collection Version Check", env=env_value)
+
+            else:
+                log_result(arn, 'rekognition', account_id, region, 'MISSING', "Collection Not Found", env="")
+
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'rekognition', account_id, region, 'ERROR', str(e))
+
+'''def check_ecs_batch(account_id, region, arns, session):
+    try:
+        client = session.client('ecs', region_name=region)
+        paginator = client.get_paginator('list_clusters')
+        all_services = {}
+
+        for page in paginator.paginate():
+            for cluster_arn in page['clusterArns']:
+                cluster_name = cluster_arn.split('/')[-1]
+                service_arns = client.list_services(cluster=cluster_arn).get('serviceArns', [])
+
+                for svc_arn in service_arns:
+                    # Determine short or long ARN format
+                    if f"/{cluster_name}/" in svc_arn:
+                        arn_type = 'LONG_ARN'
+                    else:
+                        arn_type = 'SHORT_ARN'
+
+                    all_services[svc_arn] = {
+                        'cluster_name': cluster_name,
+                        'arn_type': arn_type
+                    }
+
+        # Case-insensitive dict
+        existing_lower = {k.lower(): (k, v) for k, v in all_services.items()}
+
+        for arn in arns:
+            print(f"[INFO] Checking ECS Service ARN: {arn}")
+
+            if arn in all_services:
+                svc_data = all_services[arn]
+                env_value = get_env_tag(session, arn, region)
+
+                log_result(
+                    arn, 'ecs-service', account_id, region, svc_data['arn_type'],
+                    f"Service in Cluster: {svc_data['cluster_name']}",
+                    env=env_value
+                )
+
+            elif arn.lower() in existing_lower:
+                orig_arn, svc_data = existing_lower[arn.lower()]
+                env_value = get_env_tag(session, orig_arn, region)
+
+                log_result(
+                    orig_arn, 'ecs-service', account_id, region, svc_data['arn_type'] + ' (Case-Insensitive)',
+                    f"Service in Cluster: {svc_data['cluster_name']}",
+                    env=env_value
+                )
+
+            else:
+                log_result(arn, 'ecs-service', account_id, region, 'MISSING', "ECS Service Not Found", env="")
+
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'ecs-service', account_id, region, 'ERROR', str(e))'''
+
 #___________SERVICE FUNCTION MAP______________
 SERVICE_FUNCTION_MAP = {
     'lambda': check_lambda_batch,
@@ -736,7 +911,11 @@ SERVICE_FUNCTION_MAP = {
     'elasticbeanstalk': check_beanstalk_batch,
     'kafka': check_kafka_batch,
     'eks': check_eks_by_arn,
-    'ec2': check_ec2_by_arn
+    'ec2': check_ec2_by_arn,
+    'glue': check_glue_version_batch,
+    'kinesisanalytics': check_kinesisanalytics_sql_batch,
+    'redshift': check_redshift_batch,
+    'rekognition': check_rekognition_face_collections_batch
 }
 
 #_______________MAIN EXECUTION_________________
