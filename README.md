@@ -10,6 +10,7 @@
   4. csv
   5. threading
   6. collections
+  7. getpass
 ## Features
   1. Supports Multiple AWS Services ( Data of multiple AWS Resources from different services, regions and accounts can be fetched dynamically.)
   2. Threading (Groups arns based on service, region and account. Threading will be used for each group so that fetching parallelly.)
