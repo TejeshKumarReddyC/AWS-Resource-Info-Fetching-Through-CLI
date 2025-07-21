@@ -261,7 +261,91 @@ def check_lambda_batch(account_id, region, arns, session):
     except Exception as e:
         for arn in arns:
             log_result(arn, 'lambda', account_id, region, 'ERROR', str(e))
+
 def check_eks_by_arn(account_id, region, arns, session):
+    import re
+
+    def extract_eks_name_from_arn(arn):
+        match = re.match(r"^arn:aws:eks:[^:]+:[^:]+:cluster/(.+)$", arn)
+        return match.group(1) if match else None
+
+    try:
+        client = session.client('eks', region_name=region)
+        paginator = client.get_paginator('list_clusters')
+        existing_clusters = set()
+
+        for page in paginator.paginate():
+            existing_clusters.update(page.get('clusters', []))
+
+        for arn in arns:
+            arn = arn.strip()
+            cluster_name = extract_eks_name_from_arn(arn)
+            if not cluster_name:
+                log_result(arn, 'eks', account_id, region, 'INVALID', "Invalid EKS ARN format", env="")
+                continue
+
+            if cluster_name in existing_clusters:
+                response = client.describe_cluster(name=cluster_name)
+                version = response['cluster']['version']
+                cluster_arn = response['cluster']['arn']
+
+                # Fetch Nodegroup AMI Info + AL2 Detection
+                ami_info = []
+                al2_detected = False
+
+                try:
+                    ng_paginator = client.get_paginator('list_nodegroups')
+                    nodegroups = []
+                    for ng_page in ng_paginator.paginate(clusterName=cluster_name):
+                        nodegroups.extend(ng_page.get('nodegroups', []))
+
+                    for ng in nodegroups:
+                        ng_detail = client.describe_nodegroup(clusterName=cluster_name, nodegroupName=ng)
+                        ami_type = ng_detail['nodegroup'].get('amiType', 'Unknown')
+                        release_version = ng_detail['nodegroup'].get('releaseVersion', 'Unknown')
+
+                        if 'AL2' in ami_type.upper():
+                            al2_detected = True
+
+                        ami_info.append(f"{ng}: {ami_type} ({release_version})")
+
+                    ami_summary = "; ".join(ami_info) if ami_info else "No Managed Nodegroups found"
+
+                except Exception as ng_err:
+                    ami_summary = f"Error fetching nodegroups: {ng_err}"
+
+                # Fetch All Tags
+                try:
+                    tags_response = client.list_tags_for_resource(resourceArn=cluster_arn)
+                    tags = tags_response.get('tags', {})
+                    if tags:
+                        tags_str = "; ".join([f"{k}={v}" for k, v in tags.items()])
+                    else:
+                        tags_str = "NO_TAGS_FOUND"
+                except Exception as tag_err:
+                    tags_str = f"TagFetchError: {tag_err}"
+
+                # Determine AL2 Risk Status
+                if al2_detected:
+                    status = 'RISK_AL2_AMI'
+                else:
+                    status = 'SAFE_AMI'
+
+                # Final Output
+                log_result(
+                    arn, 'eks', account_id, region, "FOUND", 
+                    f"{status}, Kubernetes Version: {version}; Node AMIs: {ami_summary}; Tags: {tags_str}",
+                    env=tags_str
+                )
+
+            else:
+                log_result(arn, 'eks', account_id, region, 'MISSING', "EKS Cluster Not Found", env="")
+
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'eks', account_id, region, 'ERROR', str(e))
+
+"""def check_eks_by_arn(account_id, region, arns, session):
     import re
 
     def extract_eks_name_from_arn(arn):
@@ -293,13 +377,17 @@ def check_eks_by_arn(account_id, region, arns, session):
 
     except Exception as e:
         for arn in arns:
-            log_result(arn, 'eks', account_id, region, 'ERROR', str(e))
+            log_result(arn, 'eks', account_id, region, 'ERROR', str(e))"""
 
 def check_ec2_by_arn(account_id, region, arns, session):
    
     def extract_ec2_id_from_arn(arn):
         match = re.match(r"^arn:aws:ec2:[^:]+:[^:]+:instance/(.+)$", arn)
         return match.group(1) if match else None
+
+    def extract_tags(tags_list):
+        """Convert EC2 tag list to dictionary"""
+        return {tag['Key']: tag['Value'] for tag in tags_list}
 
     client = session.client('ec2', region_name=region)
     arn_map = {}
@@ -316,7 +404,7 @@ def check_ec2_by_arn(account_id, region, arns, session):
 
     found_ids = set()
 
-    # Process in chunks of 100 (API limit)
+    # Try batch first
     for i in range(0, len(instance_ids), 100):
         chunk = instance_ids[i:i + 100]
         try:
@@ -327,19 +415,57 @@ def check_ec2_by_arn(account_id, region, arns, session):
                     found_ids.add(iid)
                     state = instance['State']['Name']
                     itype = instance['InstanceType']
-                    #env_value = get_env_tag(session, iid, region, resource_type='ec2')
-                    log_result(arn_map[iid], 'ec2', account_id, region, 'FOUND', f"Type: {itype}, State: {state}")
+
+                    tags = extract_tags(instance.get('Tags', []))
+                    name = tags.get('Name', '')
+                    env_value = tags.get('Env', '')
+
+                    tag_str = ', '.join([f"{k}:{v}" for k, v in tags.items()])
+
+                    log_result(
+                        arn_map[iid],
+                        'ec2',
+                        account_id,
+                        region,
+                        'FOUND',
+                        f"Type: {itype}, State: {state}, Name: {name}, Tags: {tag_str}",
+                        env=env_value
+                    )
         except ClientError as e:
             if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
-                # Extract invalid IDs from the error message
-                missing_ids = [id.strip() for id in e.response['Error']['Message'].split("'")[1].split(',')]
-                for mid in missing_ids:
-                    log_result(arn_map.get(mid, mid), 'ec2', account_id, region, 'MISSING', "EC2 Instance Not Found", env="")
+                # Batch failed, process each ARN separately to prevent overwrite
+                for iid in chunk:
+                    try:
+                        response = client.describe_instances(InstanceIds=[iid])
+                        for reservation in response['Reservations']:
+                            for instance in reservation['Instances']:
+                                state = instance['State']['Name']
+                                itype = instance['InstanceType']
+
+                                tags = extract_tags(instance.get('Tags', []))
+                                name = tags.get('Name', '')
+                                env_value = tags.get('Env', '')
+
+                                tag_str = ', '.join([f"{k}:{v}" for k, v in tags.items()])
+
+                                log_result(
+                                    arn_map[iid],
+                                    'ec2',
+                                    account_id,
+                                    region,
+                                    'FOUND',
+                                    f"Type: {itype}, State: {state}, Name: {name}, Tags: {tag_str}",
+                                    env=env_value
+                                )
+                    except ClientError as single_e:
+                        if single_e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
+                            log_result(arn_map[iid], 'ec2', account_id, region, 'MISSING', "EC2 Instance Not Found", env="")
+                        else:
+                            log_result(arn_map[iid], 'ec2', account_id, region, 'ERROR', str(single_e), env="")
             else:
                 for iid in chunk:
-                    log_result(arn_map[iid], 'ec2', account_id, region, 'ERROR', str(e))
-
-
+                    log_result(arn_map[iid], 'ec2', account_id, region, 'ERROR', str(e), env="")
+                    
 
 def check_rds_batch(account_id, region, arns, session):
     try:
@@ -550,16 +676,23 @@ def check_waf_batch(account_id, region, arns, session):
 
         except Exception as e:
             log_result(arn, 'waf', account_id, region, 'ERROR', str(e))
+
 def check_ecs_batch(account_id, region, arns, session):
     try:
         client = session.client('ecs', region_name=region)
+
+        # Fetch clusters
         paginator = client.get_paginator('list_clusters')
         clusters = []
         for page in paginator.paginate():
             clusters.extend(page['clusterArns'])
 
+        # Prepare service and task info maps
         existing_services = {}
+        cluster_task_pv_map = {}
+
         for cluster_arn in clusters:
+            # List services per cluster
             service_paginator = client.get_paginator('list_services')
             service_arns = []
             for svc_page in service_paginator.paginate(cluster=cluster_arn):
@@ -572,28 +705,116 @@ def check_ecs_batch(account_id, region, arns, session):
                     for service in response.get('services', []):
                         service_arn = service['serviceArn']
                         launch_type = service.get('launchType', 'Unknown')
-                        existing_services[service_arn] = (cluster_arn, launch_type)
+                        service_platform_version = service.get('platformVersion', 'LATEST')
 
-        existing_lower = {k.lower(): (k, v) for k, v in existing_services.items()}
+                        # Detect short or long ARN
+                        service_arn_suffix = service_arn.split(':service/')[-1]
+                        if '/' in service_arn_suffix:
+                            arn_type = 'LONG_SERVICE_ARN'
+                        else:
+                            arn_type = 'SHORT_SERVICE_ARN'
+
+                        existing_services[service_arn] = {
+                            'cluster_arn': cluster_arn,
+                            'launch_type': launch_type,
+                            'service_platform_version': service_platform_version,
+                            'arn_type': arn_type
+                        }
+
+            # List tasks per cluster
+            task_arns = []
+            task_paginator = client.get_paginator('list_tasks')
+            for task_page in task_paginator.paginate(cluster=cluster_arn):
+                task_arns.extend(task_page['taskArns'])
+
+            if task_arns:
+                task_batches = [task_arns[i:i + 100] for i in range(0, len(task_arns), 100)]
+                for batch in task_batches:
+                    task_desc = client.describe_tasks(cluster=cluster_arn, tasks=batch)
+                    for task in task_desc.get('tasks', []):
+                        if task.get('launchType') == 'FARGATE':
+                            pv = task.get('platformVersion', 'Unknown')
+                            cluster_task_pv_map.setdefault(cluster_arn, []).append(pv)
+
+        # For case-insensitive lookup
+        clusters_lower = {c.lower(): c for c in clusters}
+        services_lower = {k.lower(): (k, v) for k, v in existing_services.items()}
 
         for arn in arns:
             print(f"[INFO] Processing ARN: {arn}")
-            if arn in existing_services:
-                cluster_arn, launch_type = existing_services[arn]
-                env_value = get_env_tag(session, arn, region)
-                log_result(arn, 'ecs', account_id, region, 'FOUND', f"Exists in cluster: {cluster_arn} (Launch Type: {launch_type})", env=env_value)
 
-            elif arn.lower() in existing_lower:
-                orig_arn, (cluster_arn, launch_type) = existing_lower[arn.lower()]
-                env_value = get_env_tag(session, orig_arn, region)
-                log_result(orig_arn, 'ecs', account_id, region, 'FOUND (Case-Insensitive)', f"Exists in cluster: {cluster_arn} (Launch Type: {launch_type})", env=env_value)
+            if ":service/" in arn:
+                # Check for service ARN
+                if arn in existing_services:
+                    data = existing_services[arn]
+                    env_value = get_env_tag(session, arn, region)
+
+                    log_result(
+                        arn, 'ecs', account_id, region, "FOUND",
+                        f"CONFIGURED_PV_{data['service_platform_version']}, "
+                        f"Launch Type: {data['launch_type']}, "
+                        f"Cluster: {data['cluster_arn']}, "
+                        f"ARN Type: {data['arn_type']}",
+                        env=env_value
+                    )
+
+                elif arn.lower() in services_lower:
+                    orig_arn, data = services_lower[arn.lower()]
+                    env_value = get_env_tag(session, orig_arn, region)
+
+                    log_result(
+                        orig_arn, 'ecs', account_id, region, "FOUND",
+                        f"CONFIGURED_PV_{data['service_platform_version']} (Case-Insensitive), "
+                        f"Launch Type: {data['launch_type']}, "
+                        f"Cluster: {data['cluster_arn']}, "
+                        f"ARN Type: {data['arn_type']}",
+                        env=env_value
+                    )
+
+                else:
+                    log_result(arn, 'ecs', account_id, region, 'MISSING_SERVICE', "ECS Service Not Found", env="")
+
+            elif ":cluster/" in arn:
+                # Check for cluster ARN and running Fargate PVs
+                if arn in clusters:
+                    fargate_pvs = cluster_task_pv_map.get(arn, [])
+                    if not fargate_pvs:
+                        status = 'SAFE_NO_FARGATE_TASKS'
+                        details = "No Fargate tasks in this cluster."
+                    elif '1.3.0' in fargate_pvs:
+                        status = 'RISK_RUNNING_PV_1.3.0'
+                        details = f"Fargate tasks with PV 1.3.0 found: {fargate_pvs}"
+                    else:
+                        status = 'SAFE_FARGATE_TASKS'
+                        details = f"Fargate PVs running: {set(fargate_pvs)}"
+
+                    log_result(arn, 'ecs', account_id, region, "FOUND", f"{status}, {details}", env="")
+
+                elif arn.lower() in clusters_lower:
+                    orig_arn = clusters_lower[arn.lower()]
+                    fargate_pvs = cluster_task_pv_map.get(orig_arn, [])
+                    if not fargate_pvs:
+                        status = 'SAFE_NO_FARGATE_TASKS (Case-Insensitive)'
+                        details = "No Fargate tasks in this cluster."
+                    elif '1.3.0' in fargate_pvs:
+                        status = 'RISK_RUNNING_PV_1.3.0 (Case-Insensitive)'
+                        details = f"Fargate tasks with PV 1.3.0 found: {fargate_pvs}"
+                    else:
+                        status = 'SAFE_FARGATE_TASKS (Case-Insensitive)'
+                        details = f"Fargate PVs running: {set(fargate_pvs)}"
+
+                    log_result(orig_arn, 'ecs', account_id, region, "FOUND", f"{status}___{details}", env="")
+
+                else:
+                    log_result(arn, 'ecs', account_id, region, 'MISSING_CLUSTER', "ECS Cluster Not Found", env="")
 
             else:
-                log_result(arn, 'ecs', account_id, region, 'MISSING', "ECS Service Not Found", env="")
+                log_result(arn, 'ecs', account_id, region, 'UNKNOWN_ARN_TYPE', "ARN is neither ECS service nor cluster", env="")
 
     except Exception as e:
         for arn in arns:
             log_result(arn, 'ecs', account_id, region, 'ERROR', str(e))
+
 
 def check_beanstalk_batch(account_id, region, arns, session):
     try:
