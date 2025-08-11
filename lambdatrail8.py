@@ -1,5 +1,5 @@
 #Author- Tejesh Kumar Reddy .C
-#Version-2.4
+#Version-2.5
 #Purpose-To check aws arn status in different accounts 
 import boto3
 import threading
@@ -1184,7 +1184,65 @@ def check_es_by_arn(account_id, region, arns, session):
     except Exception as e:
         for arn in arns:
             log_result(arn, 'ecs-service', account_id, region, 'ERROR', str(e))'''
+def check_cloudhsm(account_id, region, arns, session):
+    """
+    Accepts a list of CloudHSM cluster ARNs, names (from tags), or cluster IDs.
+    Checks presence of each in the specified region and logs the result with tags.
+    """
+    import re
+    try:
+        client = session.client('cloudhsmv2', region_name=region)
+        response = client.describe_clusters()
+        clusters = response.get('Clusters', [])
 
+        id_to_cluster = {c['ClusterId']: c for c in clusters}
+
+        # Map names from tags to cluster IDs (case-sensitive and insensitive)
+        name_to_id = {}
+        for cluster in clusters:
+            for tag in cluster.get('Tags', []):
+                if tag['Key'].lower() == 'name':
+                    name_to_id[tag['Value']] = cluster['ClusterId']
+
+        for identifier in arns:
+            cluster_id = None
+
+            if identifier.startswith("arn:"):
+                match = re.search(r'cluster/([^:/]+)', identifier)
+                cluster_id = match.group(1) if match else None
+            elif identifier in name_to_id:
+                cluster_id = name_to_id[identifier]
+            elif identifier.lower() in {k.lower(): v for k, v in name_to_id.items()}:
+                # case-insensitive match
+                cluster_id = {k.lower(): v for k, v in name_to_id.items()}[identifier.lower()]
+            else:
+                # Assume it's a raw ClusterId
+                cluster_id = identifier
+
+            cluster = id_to_cluster.get(cluster_id)
+            if cluster:
+                # Fetch full tags (not just "name")
+                cluster_arn = cluster.get('ClusterArn', '')
+                try:
+                    tag_response = client.list_tags(ResourceId=cluster_id)
+                    tags_list = tag_response.get('TagList', [])
+                except Exception:
+                    tags_list = cluster.get('Tags', [])
+
+                tags_str = ", ".join(f"{t['Key']}={t['Value']}" for t in tags_list)
+
+                state = cluster.get('State', 'Unknown')
+                hsm_type = cluster.get('HsmType', 'Unknown')
+                subnet_ids = cluster.get('SubnetIds', [])
+                log_result(identifier, 'cloudhsm', account_id, region, 'FOUND',
+                           f"State: {state}, HSM Type: {hsm_type}, Subnets: {subnet_ids}",
+                           tags_str)
+            else:
+                log_result(identifier, 'cloudhsm', account_id, region, 'MISSING', 'Cluster not found in region', "")
+
+    except Exception as e:
+        for identifier in arns:
+            log_result(identifier, 'cloudhsm', account_id, region, 'ERROR', str(e), "")
 #___________SERVICE FUNCTION MAP______________
 SERVICE_FUNCTION_MAP = {
     'lambda': check_lambda_batch,
@@ -1204,7 +1262,8 @@ SERVICE_FUNCTION_MAP = {
     'kinesisanalytics': check_kinesisanalytics_sql_batch,
     'redshift': check_redshift_batch,
     'rekognition': check_rekognition_face_collections_batch,
-    'es': check_es_by_arn
+    'es': check_es_by_arn,
+    'cloudhsm': check_cloudhsm
 }
 
 #_______________MAIN EXECUTION_________________
