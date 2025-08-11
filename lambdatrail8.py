@@ -1062,6 +1062,73 @@ def check_rekognition_face_collections_batch(account_id, region, arns, session):
         for arn in arns:
             log_result(arn, 'rekognition', account_id, region, 'ERROR', str(e))
 
+def check_es_by_arn(account_id, region, arns, session):
+    import re
+
+    def extract_es_name_from_arn(arn):
+        match = re.match(r"^arn:aws:es:[^:]+:[^:]+:domain/(.+)$", arn)
+        return match.group(1) if match else None
+
+    try:
+        client = session.client('es', region_name=region)
+
+        # Direct call (no paginator)
+        domains_resp = client.list_domain_names()
+        existing_domains = {}
+        existing_lower = {}
+
+        for domain in domains_resp.get('DomainNames', []):
+            domain_name = domain['DomainName']
+            existing_domains[domain_name] = domain_name
+            existing_lower[domain_name.lower()] = domain_name
+
+        for arn in arns:
+            arn = arn.strip()
+            domain_name = extract_es_name_from_arn(arn)
+
+            if not domain_name:
+                log_result(arn, 'es', account_id, region, 'INVALID', "Invalid OpenSearch/ES ARN format", env="")
+                continue
+
+            # Case-sensitive match first, then case-insensitive
+            if domain_name in existing_domains:
+                matched_name = existing_domains[domain_name]
+            elif domain_name.lower() in existing_lower:
+                matched_name = existing_lower[domain_name.lower()]
+            else:
+                matched_name = None
+
+            if matched_name:
+                try:
+                    desc = client.describe_elasticsearch_domain(DomainName=matched_name)
+                    domain_status = desc['DomainStatus']
+                    engine_version = domain_status.get('ElasticsearchVersion', 'Unknown')
+                    instance_type = domain_status.get('ElasticsearchClusterConfig', {}).get('InstanceType', 'Unknown')
+                    instance_count = domain_status.get('ElasticsearchClusterConfig', {}).get('InstanceCount', 'Unknown')
+
+                    # Fetch all tags for the domain
+                    try:
+                        tags_resp = client.list_tags(ARN=domain_status['ARN'])
+                        tags = tags_resp.get('TagList', [])
+                        tags_str = "; ".join([f"{t['Key']}={t['Value']}" for t in tags]) if tags else "NO_TAGS_FOUND"
+                    except Exception as tag_err:
+                        tags_str = f"TagFetchError: {tag_err}"
+
+                    log_result(
+                        arn, 'es', account_id, region, 'FOUND',
+                        f"Engine Version: {engine_version}; Instance Type: {instance_type}; Instance Count: {instance_count}",
+                        env=tags_str
+                    )
+
+                except Exception as e:
+                    log_result(arn, 'es', account_id, region, 'ERROR', str(e), env="")
+            else:
+                log_result(arn, 'es', account_id, region, 'MISSING', "Domain Not Found", env="")
+
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'es', account_id, region, 'ERROR', str(e))
+
 '''def check_ecs_batch(account_id, region, arns, session):
     try:
         client = session.client('ecs', region_name=region)
@@ -1136,7 +1203,8 @@ SERVICE_FUNCTION_MAP = {
     'glue': check_glue_version_batch,
     'kinesisanalytics': check_kinesisanalytics_sql_batch,
     'redshift': check_redshift_batch,
-    'rekognition': check_rekognition_face_collections_batch
+    'rekognition': check_rekognition_face_collections_batch,
+    'es': check_es_by_arn
 }
 
 #_______________MAIN EXECUTION_________________
