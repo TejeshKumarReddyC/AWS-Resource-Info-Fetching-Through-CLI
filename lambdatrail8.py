@@ -1,5 +1,5 @@
 #Author- Tejesh Kumar Reddy .C
-#Version-2.5
+#Version-2.6
 #Purpose-To check aws arn status in different accounts 
 import boto3
 import threading
@@ -481,57 +481,116 @@ def check_rds_batch(account_id, region, arns, session):
         for page in paginator_cluster.paginate():
             all_clusters.extend(page.get('DBClusters', []))
 
-        # Prepare case-insensitive lookup maps
+        # ARN-based lookup maps
         instance_arns = {inst['DBInstanceArn']: inst for inst in all_instances if 'DBInstanceArn' in inst}
         instance_arns_lower = {k.lower(): k for k in instance_arns}
 
         cluster_arns = {clus['DBClusterArn']: clus for clus in all_clusters if 'DBClusterArn' in clus}
         cluster_arns_lower = {k.lower(): k for k in cluster_arns}
 
+        # Name-based fallback maps
+        instance_names = {inst['DBInstanceIdentifier']: inst for inst in all_instances if 'DBInstanceIdentifier' in inst}
+        instance_names_lower = {k.lower(): k for k in instance_names}
+
+        cluster_names = {clus['DBClusterIdentifier']: clus for clus in all_clusters if 'DBClusterIdentifier' in clus}
+        cluster_names_lower = {k.lower(): k for k in cluster_names}
+
         for arn in arns:
             print('yes')
+            matched = False
+
+            # ---------- Check by ARN ----------
             if arn in instance_arns:
                 inst = instance_arns[arn]
-                engine = inst.get('Engine', 'Unknown')
-                engine_version = inst.get('EngineVersion', 'Unknown')
-                instance_class = inst.get('DBInstanceClass', 'Unknown')
-                ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
-                env_value = get_env_tag(session, arn, region)
-                log_result(arn, 'rds', account_id, region, 'FOUND',
-                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}", env=env_value)
+                matched = True
+                match_type = "FOUND"
             elif arn.lower() in instance_arns_lower:
                 matched_arn = instance_arns_lower[arn.lower()]
                 inst = instance_arns[matched_arn]
+                matched = True
+                match_type = "FOUND (Case-Insensitive)"
+            else:
+                inst = None
+
+            if inst:
                 engine = inst.get('Engine', 'Unknown')
                 engine_version = inst.get('EngineVersion', 'Unknown')
                 instance_class = inst.get('DBInstanceClass', 'Unknown')
                 ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
                 env_value = get_env_tag(session, arn, region)
-                log_result(matched_arn, 'rds', account_id, region, 'FOUND (Case-Insensitive)',
+                log_result(arn if match_type == "FOUND" else matched_arn, 'rds', account_id, region, match_type,
                            f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}", env=env_value)
-            elif arn in cluster_arns:
+                continue  # move to next arn
+
+            if arn in cluster_arns:
                 clus = cluster_arns[arn]
-                engine = clus.get('Engine', 'Unknown')
-                engine_version = clus.get('EngineVersion', 'Unknown')
-                ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
-                instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
-                env_value = get_env_tag(session, arn, region)
-                log_result(arn, 'rds', account_id, region, 'FOUND',
-                           f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
-                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}",env=env_value)
+                matched = True
+                match_type = "FOUND"
             elif arn.lower() in cluster_arns_lower:
                 matched_arn = cluster_arns_lower[arn.lower()]
                 clus = cluster_arns[matched_arn]
+                matched = True
+                match_type = "FOUND (Case-Insensitive)"
+            else:
+                clus = None
+
+            if clus:
                 engine = clus.get('Engine', 'Unknown')
                 engine_version = clus.get('EngineVersion', 'Unknown')
                 ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
                 instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
                 env_value = get_env_tag(session, arn, region)
-                log_result(matched_arn, 'rds', account_id, region, 'FOUND (Case-Insensitive)',
+                log_result(arn if match_type == "FOUND" else matched_arn, 'rds', account_id, region, match_type,
                            f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
-                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}",env=env_value)
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}", env=env_value)
+                continue  # move to next arn
+
+            # ---------- Fallback to Name Matching ----------
+            arn_name = arn.split(":")[-1] if ":" in arn else arn  # extract name from ARN or use directly
+
+            if arn_name in instance_names:
+                inst = instance_names[arn_name]
+                engine = inst.get('Engine', 'Unknown')
+                engine_version = inst.get('EngineVersion', 'Unknown')
+                instance_class = inst.get('DBInstanceClass', 'Unknown')
+                ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
+                env_value = get_env_tag(session, arn, region)
+                log_result(inst['DBInstanceArn'], 'rds', account_id, region, 'FOUND (Name Fallback)',
+                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}", env=env_value)
+            elif arn_name.lower() in instance_names_lower:
+                matched_name = instance_names_lower[arn_name.lower()]
+                inst = instance_names[matched_name]
+                engine = inst.get('Engine', 'Unknown')
+                engine_version = inst.get('EngineVersion', 'Unknown')
+                instance_class = inst.get('DBInstanceClass', 'Unknown')
+                ca_cert = inst.get('CACertificateIdentifier', 'Unknown')
+                env_value = get_env_tag(session, arn, region)
+                log_result(inst['DBInstanceArn'], 'rds', account_id, region, 'FOUND (Name Fallback - Case-Insensitive)',
+                           f"Engine: {engine} {engine_version}, Class: {instance_class}, CA: {ca_cert}", env=env_value)
+            elif arn_name in cluster_names:
+                clus = cluster_names[arn_name]
+                engine = clus.get('Engine', 'Unknown')
+                engine_version = clus.get('EngineVersion', 'Unknown')
+                ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
+                instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
+                env_value = get_env_tag(session, arn, region)
+                log_result(clus['DBClusterArn'], 'rds', account_id, region, 'FOUND (Name Fallback)',
+                           f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}", env=env_value)
+            elif arn_name.lower() in cluster_names_lower:
+                matched_name = cluster_names_lower[arn_name.lower()]
+                clus = cluster_names[matched_name]
+                engine = clus.get('Engine', 'Unknown')
+                engine_version = clus.get('EngineVersion', 'Unknown')
+                ca_cert = clus.get('CACertificateIdentifier', 'Unknown')
+                instance_ids = [m['DBInstanceIdentifier'] for m in clus.get('DBClusterMembers', [])]
+                env_value = get_env_tag(session, arn, region)
+                log_result(clus['DBClusterArn'], 'rds', account_id, region, 'FOUND (Name Fallback - Case-Insensitive)',
+                           f"Engine: {engine} {engine_version}, Instance_count: {len(instance_ids)}, "
+                           f"Instances: {', '.join(instance_ids)}, CA: {ca_cert}", env=env_value)
             else:
-                log_result(arn, 'rds', account_id, region, 'MISSING', 'RDS ARN Not found', env="")
+                # Still not found
+                log_result(arn, 'rds', account_id, region, 'MISSING', 'RDS ARN or Name not found', env="")
 
     except Exception as e:
         for arn in arns:
@@ -562,36 +621,182 @@ def check_dms_batch(account_id, region, arns, session):
 def check_sagemaker_batch(account_id, region, arns, session):
     try:
         client = session.client('sagemaker', region_name=region)
-        paginator = client.get_paginator('list_notebook_instances')
-        actual_arns = []
-        arn_to_name = {}
-        for page in paginator.paginate():
-            for notebook in page.get('NotebookInstances', []):
-                arn = notebook['NotebookInstanceArn']
-                name = notebook['NotebookInstanceName']
-                actual_arns.append(arn)
-                arn_to_name[arn.lower()] = name  # map lowercased ARN to name for describe
 
-        existing_lower = {arn.lower(): arn for arn in actual_arns}
+        # ------------------------------------------------------------------
+        # PRELOAD NOTEBOOK INSTANCES FOR FAST MATCHING
+        # ------------------------------------------------------------------
+        paginator = client.get_paginator('list_notebook_instances')
+        actual_nb_arns = []
+        arn_to_name = {}
+
+        for page in paginator.paginate():
+            for notebook in page.get("NotebookInstances", []):
+                arn = notebook["NotebookInstanceArn"]
+                name = notebook["NotebookInstanceName"]
+                actual_nb_arns.append(arn)
+                arn_to_name[arn.lower()] = name
+
+        nb_lower_map = {arn.lower(): arn for arn in actual_nb_arns}
+
+        # ARN matchers
+        nb_pattern       = r":notebook-instance\/"
+        app_pattern      = r":app\/d-"
+        endpoint_pattern = r":endpoint\/"
+
+        # app type normalization map
+        APP_TYPE_MAP = {
+            "jupyterserver": "JupyterServer",
+            "kernelgateway": "KernelGateway",
+            "codeeditor": "CodeEditor",
+            "rstudio": "RStudioServer",
+            "rstudio-server": "RStudioServer",
+            "rstudio-server-pro": "RStudioServerPro",
+            "canvas": "Canvas",
+            "studio": "Studio"
+        }
 
         for arn in arns:
-            print("Processing the", arn)
-            if arn in actual_arns:
-                nb_desc = client.describe_notebook_instance(NotebookInstanceName=arn_to_name[arn.lower()])
-                platform = nb_desc.get('PlatformIdentifier', 'Unknown')
-                env_value = get_env_tag(session, arn, region)
-                log_result(arn, 'sagemaker', account_id, region, 'FOUND', f"Platform: {platform}", env=env_value)
-            elif arn.lower() in existing_lower:
-                actual_arn = existing_lower[arn.lower()]
-                nb_desc = client.describe_notebook_instance(NotebookInstanceName=arn_to_name[arn.lower()])
-                platform = nb_desc.get('PlatformIdentifier', 'Unknown')
-                env_value = get_env_tag(session, arn, region)
-                log_result(actual_arn, 'sagemaker', account_id, region, 'FOUND (Case-Insensitive)', f"Platform: {platform}", env=env_value)
-            else:
-                log_result(arn, 'sagemaker', account_id, region, 'MISSING', 'Notebook ARN not found', env="")
+            arn_lower = arn.lower()
+            print("Processing:", arn)
+
+            # ------------------------------------------------------------------
+            #  NOTEBOOK INSTANCE
+            # ------------------------------------------------------------------
+            if re.search(nb_pattern, arn_lower):
+                if arn_lower in nb_lower_map:
+                    actual_arn = nb_lower_map[arn_lower]
+                    nb_desc = client.describe_notebook_instance(
+                        NotebookInstanceName=arn_to_name[arn_lower]
+                    )
+
+                    platform = nb_desc.get("PlatformIdentifier", "Unknown")
+                    instance_type = nb_desc.get("InstanceType", "Unknown")
+                    instance_class = (
+                        instance_type.split(".")[1]
+                        if instance_type != "Unknown" and "." in instance_type
+                        else "Unknown"
+                    )
+
+                    env_value = get_env_tag(session, arn, region)
+
+                    log_result(
+                        actual_arn, "sagemaker", account_id, region, "FOUND",
+                        f"Notebook Platform: {platform}, InstanceType: {instance_type}, InstanceClass: {instance_class}",
+                        env=env_value
+                    )
+                else:
+                    log_result(
+                        arn, "sagemaker", account_id, region,
+                        "MISSING", "Notebook instance not found", env=""
+                    )
+                continue
+
+            # ------------------------------------------------------------------
+            # SAGEMAKER STUDIO APP (INCLUDING CODEEDITOR)
+            # ------------------------------------------------------------------
+            if re.search(app_pattern, arn_lower):
+
+                try:
+                    # arn:aws:sagemaker:region:acct:app/domain/user/appType/appName
+                    parts = arn.split(":")[5].split("/")
+                    domain_id = parts[1]
+                    user_id   = parts[2]
+
+                    raw_app_type = parts[3].lower()
+                    app_type = APP_TYPE_MAP.get(raw_app_type, parts[3])
+                    app_name = parts[4]
+
+                    app_desc = client.describe_app(
+                        DomainId=domain_id,
+                        UserProfileName=user_id,
+                        AppType=app_type,
+                        AppName=app_name
+                    )
+
+                    status = app_desc.get("Status", "Unknown")
+                    resource = app_desc.get("ResourceSpec", {})
+                    instance_type = resource.get("InstanceType", "Unknown")
+
+                    # derive instance class
+                    if instance_type != "Unknown" and "." in instance_type:
+                        instance_class = instance_type.split(".")[1]
+                    else:
+                        instance_class = "Unknown"
+
+                    env_value = get_env_tag(session, arn, region)
+
+                    log_result(
+                        arn, "sagemaker", account_id, region, "FOUND",
+                        f"AppType: {app_type}, Status: {status}, InstanceType: {instance_type}, InstanceClass: {instance_class}",
+                        env=env_value
+                    )
+
+                except Exception as e:
+                    log_result(
+                        arn, "sagemaker", account_id, region, "ERROR",
+                        f"App check failed: {str(e)}"
+                    )
+                continue
+
+            # ------------------------------------------------------------------
+            # ENDPOINT
+            # ------------------------------------------------------------------
+            if re.search(endpoint_pattern, arn_lower):
+                try:
+                    endpoint_name = arn.split("/")[-1]
+
+                    ep_desc = client.describe_endpoint(
+                        EndpointName=endpoint_name
+                    )
+
+                    status = ep_desc.get("EndpointStatus", "Unknown")
+                    config_name = ep_desc.get("EndpointConfigName", "Unknown")
+
+                    # get instance type from endpoint config
+                    config_desc = client.describe_endpoint_config(
+                        EndpointConfigName=config_name
+                    )
+
+                    pv = config_desc.get("ProductionVariants", [])
+                    instance_type = (
+                        pv[0].get("InstanceType", "Unknown")
+                        if pv else "Unknown"
+                    )
+
+                    if instance_type != "Unknown" and "." in instance_type:
+                        instance_class = instance_type.split(".")[1]
+                    else:
+                        instance_class = "Unknown"
+
+                    env_value = get_env_tag(session, arn, region)
+
+                    log_result(
+                        arn, "sagemaker", account_id, region, "FOUND",
+                        f"EndpointStatus: {status}, InstanceType: {instance_type}, InstanceClass: {instance_class}",
+                        env=env_value
+                    )
+
+                except Exception as e:
+                    log_result(
+                        arn, "sagemaker", account_id, region, "ERROR",
+                        f"Endpoint check failed: {str(e)}"
+                    )
+                continue
+
+            # ------------------------------------------------------------------
+            # UNKNOWN ARN TYPE
+            # ------------------------------------------------------------------
+            log_result(
+                arn, "sagemaker", account_id, region,
+                "MISSING", "Unrecognized SageMaker ARN type", env=""
+            )
+
     except Exception as e:
         for arn in arns:
-            log_result(arn, 'sagemaker', account_id, region, 'ERROR', str(e))
+            log_result(
+                arn, "sagemaker", account_id, region,
+                "ERROR", str(e)
+            )
 
 def check_mq_batch(account_id, region, arns, session):
     try:
@@ -946,38 +1151,72 @@ def check_glue_version_batch(account_id, region, arns, session):
         for arn in arns:
             log_result(arn, 'glue', account_id, region, 'ERROR', str(e))
 
-def check_kinesisanalytics_sql_batch(account_id, region, arns, session):
+def check_kinesis_analytics(account_id, region, arns, session):
     try:
-        client = session.client('kinesisanalytics', region_name=region)  # v1 API for SQL apps
-        response = client.list_applications()
-        existing = {}
+        kda_client = session.client('kinesisanalyticsv2', region_name=region)
 
-        for app in response['ApplicationSummaries']:
-            app_name = app['ApplicationName']
-            app_arn = f"arn:aws:kinesisanalytics:{region}:{account_id}:application/{app_name}"
+        # Collect existing Kinesis Analytics applications (SQL + Flink)
+        kda_apps = {}
+        paginator = kda_client.get_paginator('list_applications')
+        for page in paginator.paginate():
+            for app in page['ApplicationSummaries']:
+                app_name = app['ApplicationName']
+                details = kda_client.describe_application(ApplicationName=app_name)
+                app_desc = details['ApplicationDetail']
+                arn = app_desc['ApplicationARN']
+                runtime_env = app_desc.get('RuntimeEnvironment', 'Unknown')
 
-            existing[app_arn] = 'KDA_SQL_DEPRECATED'
+                # Fetch tags for the ARN
+                try:
+                    tag_response = kda_client.list_tags_for_resource(ResourceARN=arn)
+                    tags = {t['Key']: t['Value'] for t in tag_response.get('Tags', [])}
+                except Exception:
+                    tags = {}
 
-        existing_lower = {k.lower(): (k, v) for k, v in existing.items()}
+                kda_apps[arn] = {"runtime": runtime_env, "tags": tags}
 
+        # Lowercase mappings for case-insensitive checks
+        kda_lower = {k.lower(): (k, v) for k, v in kda_apps.items()}
+
+        # Process ARNs
         for arn in arns:
-            print(f"[INFO] Processing Kinesis Analytics SQL ARN: {arn}")
+            print(f"[INFO] Processing ARN: {arn}")
 
-            if arn in existing:
-                env_value = get_env_tag(session, arn, region)
-                log_result(arn, 'kinesisanalytics-sql', account_id, region, "FOUND", "KDA_SQL_DEPRECATED - SQL App Detected", env=env_value)
+            if arn in kda_apps:
+                runtime = kda_apps[arn]["runtime"]
+                tags = kda_apps[arn]["tags"]
 
-            elif arn.lower() in existing_lower:
-                orig_arn, _ = existing_lower[arn.lower()]
-                env_value = get_env_tag(session, orig_arn, region)
-                log_result(orig_arn, 'kinesisanalytics-sql', account_id, region, "FOUND", "KDA_SQL_DEPRECATED - SQL App Detected", env=env_value)
+                if runtime.startswith("SQL"):
+                    log_result(arn, 'kinesisanalytics-sql', account_id, region,
+                               'FOUND', f"Exists (Runtime: {runtime})", env=tags)
+                elif runtime.startswith("FLINK"):
+                    log_result(arn, 'kinesisanalytics-flink', account_id, region,
+                               'FOUND', f"Exists (Runtime: {runtime})", env=tags)
+                else:
+                    log_result(arn, 'kinesisanalytics', account_id, region,
+                               'FOUND', f"Exists (Runtime: {runtime})", env=tags)
+
+            elif arn.lower() in kda_lower:
+                orig_arn, details = kda_lower[arn.lower()]
+                runtime = details["runtime"]
+                tags = details["tags"]
+
+                if runtime.startswith("SQL"):
+                    log_result(orig_arn, 'kinesisanalytics-sql', account_id, region,
+                               'FOUND (Case-Insensitive)', f"Exists (Runtime: {runtime})", env=tags)
+                elif runtime.startswith("FLINK"):
+                    log_result(orig_arn, 'kinesisanalytics-flink', account_id, region,
+                               'FOUND (Case-Insensitive)', f"Exists (Runtime: {runtime})", env=tags)
+                else:
+                    log_result(orig_arn, 'kinesisanalytics', account_id, region,
+                               'FOUND (Case-Insensitive)', f"Exists (Runtime: {runtime})", env=tags)
 
             else:
-                log_result(arn, 'kinesisanalytics-sql', account_id, region, 'MISSING', "Kinesis SQL App Not Found", env="")
+                log_result(arn, 'kinesisanalytics', account_id, region, 'MISSING', "Application Not Found", env={})
 
     except Exception as e:
         for arn in arns:
-            log_result(arn, 'kinesisanalytics-sql', account_id, region, 'ERROR', str(e))
+            log_result(arn, 'kinesisanalytics', account_id, region, 'ERROR', str(e))    
 
 def check_redshift_batch(account_id, region, arns, session):
     try:
@@ -1020,48 +1259,64 @@ def check_redshift_batch(account_id, region, arns, session):
         for arn in arns:
             log_result(arn, 'redshift', account_id, region, 'ERROR', str(e))
 
-def check_rekognition_face_collections_batch(account_id, region, arns, session):
+def check_rekognition_face_models(account_id, region, arns, session):
     try:
         client = session.client('rekognition', region_name=region)
-        response = client.list_collections()
-        existing = {}
-
-        for collection_id in response['CollectionIds']:
-            desc = client.describe_collection(CollectionId=collection_id)
-            model_version = desc.get('FaceModelVersion', 'Unknown')
-            collection_arn = f"arn:aws:rekognition:{region}:{account_id}:collection/{collection_id}"
-
-            if model_version in ['1.0', '2.0', '3.0', '4.0']:
-                status = f'DEPRECATED_MODEL_{model_version}'
-            elif model_version == '7.0':
-                status = 'CURRENT_MODEL_V7'
+        collections = {}
+        next_token = None
+        while True:
+            if next_token:
+                response = client.list_collections(NextToken=next_token)
             else:
-                status = f'UNKNOWN_MODEL_{model_version}'
+                response = client.list_collections()
+            for coll_id, face_model in zip(
+                response.get("CollectionIds", []),
+                response.get("FaceModelVersions", [])
+            ):
+                coll_arn = f"arn:aws:rekognition:{region}:{account_id}:collection/{coll_id}"
 
-            existing[collection_arn] = status
+                # Fetch tags
+                try:
+                    tag_response = client.list_tags_for_resource(ResourceArn=coll_arn)
+                    print(tag_response)
+                    tags = tag_response.get("Tags", {})					
+                except Exception:
+                    tags = {}
 
-        existing_lower = {k.lower(): (k, v) for k, v in existing.items()}
+                collections[coll_arn] = {"runtime": face_model, "tags": tags}
 
+            next_token = response.get("NextToken")
+            if not next_token:
+                break
+
+        # Lowercase mapping for case-insensitive lookups
+        collections_lower = {k.lower(): (k, v) for k, v in collections.items()}
+
+        # Process ARNs
         for arn in arns:
-            print(f"[INFO] Processing Rekognition Collection ARN: {arn}")
+            print(f"[INFO] Processing ARN: {arn}")
 
-            if arn in existing:
-                coll_status = existing[arn]
-                env_value = get_env_tag(session, arn, region)
-                log_result(arn, 'rekognition', account_id, region, coll_status, "Collection Version Check", env=env_value)
+            if arn in collections:
+                runtime = collections[arn]["runtime"]
+                tags = collections[arn]["tags"]
+                log_result(arn, 'rekognition-face', account_id, region,
+                           'FOUND', f"Exists (FaceModelVersion: {runtime})", env=tags)
 
-            elif arn.lower() in existing_lower:
-                orig_arn, coll_status = existing_lower[arn.lower()]
-                env_value = get_env_tag(session, orig_arn, region)
-                log_result(orig_arn, 'rekognition', account_id, region, coll_status + ' (Case-Insensitive)', "Collection Version Check", env=env_value)
+            elif arn.lower() in collections_lower:
+                orig_arn, details = collections_lower[arn.lower()]
+                runtime = details["runtime"]
+                tags = details["tags"]
+                log_result(orig_arn, 'rekognition-face', account_id, region,
+                           'FOUND (Case-Insensitive)', f"Exists (FaceModelVersion: {runtime})", env=tags)
 
             else:
-                log_result(arn, 'rekognition', account_id, region, 'MISSING', "Collection Not Found", env="")
+                log_result(arn, 'rekognition-face', account_id, region,
+                           'MISSING', "Collection Not Found", env={})
 
     except Exception as e:
         for arn in arns:
-            log_result(arn, 'rekognition', account_id, region, 'ERROR', str(e))
-
+            log_result(arn, 'rekognition-face', account_id, region, 'ERROR', str(e))
+            
 def check_es_by_arn(account_id, region, arns, session):
     import re
 
@@ -1185,11 +1440,6 @@ def check_es_by_arn(account_id, region, arns, session):
         for arn in arns:
             log_result(arn, 'ecs-service', account_id, region, 'ERROR', str(e))'''
 def check_cloudhsm(account_id, region, arns, session):
-    """
-    Accepts a list of CloudHSM cluster ARNs, names (from tags), or cluster IDs.
-    Checks presence of each in the specified region and logs the result with tags.
-    """
-    import re
     try:
         client = session.client('cloudhsmv2', region_name=region)
         response = client.describe_clusters()
@@ -1243,6 +1493,65 @@ def check_cloudhsm(account_id, region, arns, session):
     except Exception as e:
         for identifier in arns:
             log_result(identifier, 'cloudhsm', account_id, region, 'ERROR', str(e), "")
+
+import boto3
+
+def check_synthetics_batch(account_id, region, arns, session):
+    try:
+        client = session.client('synthetics', region_name=region)
+
+        # Collect existing canaries (manual pagination with NextToken)
+        canaries = {}
+        next_token = None
+
+        while True:
+            if next_token:
+                response = client.describe_canaries(NextToken=next_token)
+            else:
+                response = client.describe_canaries()
+
+            for canary in response.get('Canaries', []):
+                # Build full ARN manually since "Arn" is missing
+                name = canary['Name']
+                arn = f"arn:aws:synthetics:{region}:{account_id}:canary:{name}"
+
+                runtime = canary.get('RuntimeVersion', 'Unknown')
+                tags = canary.get('Tags', {})
+
+                canaries[arn] = {"runtime": runtime, "tags": tags}
+                
+            next_token = response.get('NextToken')
+            if not next_token:
+                break
+
+        # Lowercase mapping for case-insensitive lookups
+        canaries_lower = {k.lower(): (k, v) for k, v in canaries.items()}
+
+        # Process ARNs
+        for arn in arns:
+            print(f"[INFO] Processing ARN: {arn}")
+
+            if arn in canaries:
+                runtime = canaries[arn]["runtime"]
+                tags = canaries[arn]["tags"]
+                log_result(arn, 'synthetics', account_id, region,
+                           'FOUND', f"Exists (Runtime: {runtime})", env=tags)
+
+            elif arn.lower() in canaries_lower:
+                orig_arn, details = canaries_lower[arn.lower()]
+                runtime = details["runtime"]
+                tags = details["tags"]
+                log_result(orig_arn, 'synthetics', account_id, region,
+                           'FOUND (Case-Insensitive)', f"Exists (Runtime: {runtime})", env=tags)
+
+            else:
+                log_result(arn, 'synthetics', account_id, region,
+                           'MISSING', "Canary Not Found", env={})
+
+    except Exception as e:
+        for arn in arns:
+            log_result(arn, 'synthetics', account_id, region, 'ERROR', str(e))
+
 #___________SERVICE FUNCTION MAP______________
 SERVICE_FUNCTION_MAP = {
     'lambda': check_lambda_batch,
@@ -1259,11 +1568,12 @@ SERVICE_FUNCTION_MAP = {
     'eks': check_eks_by_arn,
     'ec2': check_ec2_by_arn,
     'glue': check_glue_version_batch,
-    'kinesisanalytics': check_kinesisanalytics_sql_batch,
+    'kinesisanalytics': check_kinesis_analytics,
     'redshift': check_redshift_batch,
-    'rekognition': check_rekognition_face_collections_batch,
+    'rekognition': check_rekognition_face_models,
     'es': check_es_by_arn,
-    'cloudhsm': check_cloudhsm
+    'cloudhsm': check_cloudhsm,
+    'synthetics': check_synthetics_batch
 }
 
 #_______________MAIN EXECUTION_________________
